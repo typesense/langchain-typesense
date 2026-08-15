@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: '0.12.3'
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --group test --group lint
+      - name: Lint
+        run: uv run --locked --group lint ruff check .
+      - name: Check formatting
+        run: uv run --locked --group lint ruff format --check .
+      - name: Type check
+        run: uv run --locked --group lint mypy langchain_typesense
+      - name: Ty check
+        run: uv run --locked --group lint ty check
+      - name: Unit tests
+        run: >-
+          uv run --locked --group test pytest --disable-socket
+          --allow-unix-socket tests/unit_tests
+      - name: Build distributions
+        run: uv build
+
+  integration:
+    name: LangChain standard integration tests
+    runs-on: ubuntu-latest
+    services:
+      typesense:
+        image: typesense/typesense:30.2
+        env:
+          TYPESENSE_API_KEY: xyz
+          TYPESENSE_DATA_DIR: /data
+        ports:
+          - 8108:8108
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: '0.12.3'
+          python-version: '3.12'
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --group test --group test_integration
+      - name: Wait for Typesense
+        run: |
+          uv run python - <<'PY'
+          import json
+          import time
+          from urllib.error import URLError
+          from urllib.request import urlopen
+
+          for attempt in range(30):
+              try:
+                  with urlopen("http://localhost:8108/health", timeout=1) as response:
+                      if json.load(response).get("ok") is True:
+                          break
+              except (OSError, URLError):
+                  pass
+              time.sleep(1)
+          else:
+              raise RuntimeError("Typesense did not become healthy within 30 seconds")
+          PY
+      - name: Run standard tests
+        run: >-
+          uv run --locked --group test --group test_integration
+          pytest tests/integration_tests

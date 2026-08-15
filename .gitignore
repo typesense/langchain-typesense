@@ -1,0 +1,10 @@
+/.pytest_cache
+/.coverage
+/.venv
+/.vscode
+/dist
+/typesense-data
+**/__pycache__/
+.mypy_cache/
+.benchmarks/
+.ruff_cache/
