@@ -36,7 +36,8 @@ jobs:
       - name: Unit tests
         run: >-
           uv run --locked --group test pytest --disable-socket
-          --allow-unix-socket tests/unit_tests
+          --allow-unix-socket --cov=langchain_typesense
+          --cov-report=term-missing --cov-fail-under=70 tests/unit_tests
       - name: Build distributions
         run: uv build
 

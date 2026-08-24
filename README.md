@@ -1,46 +1,37 @@
 # langchain-typesense
 
-`langchain-typesense` is a typed, standalone LangChain `VectorStore` integration for
-[Typesense](https://typesense.org). It replaces the archived
-`langchain_community.vectorstores.Typesense` integration and follows the current
-LangChain vector-store contract, including synchronous and asynchronous operations,
-relevance scores, maximal marginal relevance (MMR), ID lookup, and standard integration
-tests.
+`langchain-typesense` is a typed LangChain `VectorStore` integration for
+[Typesense](https://typesense.org). It stores LangChain documents and embeddings in a
+Typesense collection and supports synchronous and asynchronous writes, vector search,
+relevance scores, MMR, metadata filters, ID lookup, and deletion.
 
-## Requirements
+The package targets Typesense Server 30.2 and the 2.x `typesense` Python client.
+
+## Requirements and installation
 
 - Python 3.10 or newer
 - `langchain-core` 1.x
-- `typesense` Python client 2.x
-- A Typesense server with vector-search support
-- A LangChain `Embeddings` implementation whose document and query vectors have the
-  same, stable dimension
+- `typesense` 2.x
+- Typesense Server 30.2
+- A LangChain `Embeddings` implementation
 
-Install the integration and the package for your embedding provider. For example:
+Install the integration together with the embedding provider used by your application:
 
 ```bash
 pip install -U langchain-typesense langchain-openai
 ```
 
-This package does not install an embedding provider automatically.
+Install the embedding provider separately.
 
-## Start Typesense locally
-
-The repository includes a Typesense 30.2 development service:
+For local development, the repository includes Typesense 30.2:
 
 ```bash
 docker compose up -d
+# Typesense listens on http://localhost:8108; the development key is xyz.
 ```
 
-It listens on `http://localhost:8108` and uses the development API key `xyz`. Stop it
-when finished:
-
-```bash
-docker compose down
-```
-
-The Compose configuration stores server data in `./typesense-data`. Stopping the
-container does not delete that data.
+The Compose service stores data in `./typesense-data`; stopping it does not remove that
+directory. Run `docker compose down` when finished.
 
 ## Quickstart
 
@@ -51,107 +42,79 @@ from langchain_openai import OpenAIEmbeddings
 
 from langchain_typesense import TypesenseVectorStore
 
-config = {
-    "nodes": [{"host": "localhost", "port": 8108, "protocol": "http"}],
-    "api_key": "xyz",
-    "connection_timeout_seconds": 2,
-}
-
+client = typesense.Client(
+    {
+        "nodes": [{"host": "localhost", "port": 8108, "protocol": "http"}],
+        "api_key": "xyz",
+        "connection_timeout_seconds": 2,
+    }
+)
 store = TypesenseVectorStore(
-    client=typesense.Client(config),
+    client=client,
     embedding=OpenAIEmbeddings(model="text-embedding-3-small"),
     collection_name="my-documents",
 )
 
-documents = [
-    Document(page_content="Typesense is fast", metadata={"source": "docs"}),
-    Document(
-        page_content="LangChain composes AI applications",
-        metadata={"source": "blog"},
-    ),
-]
-ids = store.add_documents(documents, ids=["typesense", "langchain"])
+store.add_documents(
+    [
+        Document(page_content="Typesense is fast", metadata={"source": "docs"}),
+        Document(page_content="LangChain composes applications", metadata={"source": "blog"}),
+    ],
+    ids=["typesense", "langchain"],
+)
 
 matches = store.similarity_search(
     "Which search engine is fast?",
     k=2,
     filter={"source": "docs"},
 )
-
+print(matches)
 store.close()
 ```
 
-The collection is created lazily on the first non-empty write. If it already exists,
-its schema is validated before documents are imported.
+Collections are created lazily on the first non-empty write. Existing collections are
+validated against the configured text, vector, distance, metadata, and nested-field
+settings before an import.
 
-## Client construction
+## Clients and lifecycle
 
-### Synchronous client
-
-Pass an existing `typesense.Client` when the application owns client configuration:
+Pass an existing client when the application owns connection configuration. The
+constructor accepts a synchronous `typesense.Client`, an optional `typesense.AsyncClient`,
+or both:
 
 ```python
-import typesense
-from langchain_openai import OpenAIEmbeddings
-from langchain_typesense import TypesenseVectorStore
-
-config = {
-    "nodes": [{"host": "localhost", "port": 8108, "protocol": "http"}],
-    "api_key": "xyz",
-    "connection_timeout_seconds": 2,
-}
-
 store = TypesenseVectorStore(
-    client=typesense.Client(config),
-    embedding=OpenAIEmbeddings(model="text-embedding-3-small"),
+    client=client,
+    async_client=async_client,
+    embedding=embeddings,
     collection_name="my-documents",
 )
 ```
 
-If only a synchronous client is configured, asynchronous methods remain available.
-They execute their synchronous equivalents in LangChain's worker executor.
-
-### Native asynchronous I/O
-
-Pass both client types to use the Typesense async client and the embedding provider's
-async methods:
+If no async client is supplied, async store methods run the synchronous operation in a
+worker executor. An async-only application can pass `client=None` and use native async
+operations:
 
 ```python
 import typesense
-from langchain_openai import OpenAIEmbeddings
-from langchain_typesense import TypesenseVectorStore
-
-config = {
-    "nodes": [{"host": "localhost", "port": 8108, "protocol": "http"}],
-    "api_key": "xyz",
-    "connection_timeout_seconds": 2,
-}
 
 store = TypesenseVectorStore(
-    client=typesense.Client(config),
+    client=None,
     async_client=typesense.AsyncClient(config),
-    embedding=OpenAIEmbeddings(model="text-embedding-3-small"),
+    embedding=embeddings,
     collection_name="my-documents",
 )
-
-ids = await store.aadd_texts(
-    ["alpha", "beta"],
-    metadatas=[{"source": "a"}, {"source": "b"}],
-    ids=["alpha", "beta"],
-)
+await store.aadd_texts(["alpha", "beta"], ids=["alpha", "beta"])
 matches = await store.asimilarity_search("alpha", k=2)
-
-# Closes the async client first, then the sync client.
 await store.aclose()
 ```
 
-`close()` closes only the synchronous client's HTTP resources. `aclose()` closes both
-configured clients. Do not use either client after closing the store.
+Use `close()` for a synchronous client and `aclose()` for an asynchronous client. When
+both are supplied, `aclose()` closes both pools. Do not reuse clients after the store
+closes them.
 
-### Connection-parameter constructor and environment key
-
-`from_client_params` creates both sync and async clients. It accepts `api_key` directly
-or reads `TYPESENSE_API_KEY` when neither API-key argument is supplied:
+`from_client_params` is a convenience constructor for applications that want the
+integration to create the Typesense client(s):
 
 ```bash
 export TYPESENSE_API_KEY="your-typesense-api-key"
@@ -160,254 +123,123 @@ export TYPESENSE_API_KEY="your-typesense-api-key"
 ```python
 store = TypesenseVectorStore.from_client_params(
     embedding=embeddings,
-    host="example.a1.typesense.net",
-    port=443,
-    protocol="https",
-    connection_timeout_seconds=2.0,
+    typesense_url="https://example.a1.typesense.net",
+    client_mode="sync",  # the default; also "async" or "both"
     collection_name="my-documents",
 )
 ```
 
-The complete signature is:
+`typesense_url` must be an absolute HTTP(S) URL without a path, query, or fragment.
+`api_key` may be passed explicitly or read from `TYPESENSE_API_KEY`. The default
+`client_mode="sync"` creates one synchronous connection pool; choose `"async"` or
+`"both"` when those operations are needed. Supplying both modes creates two pools and
+requires cleaning up both clients.
 
-```python
-TypesenseVectorStore.from_client_params(
-    embedding,
-    *,
-    host="localhost",
-    port=8108,
-    protocol="http",
-    api_key=None,
-    typesense_api_key=None,
-    connection_timeout_seconds=2.0,
-    collection_name="langchain-typesense",
-    **constructor_options,
-)
-```
-
-`typesense_api_key` is retained as a migration alias. Passing different non-empty
-values for `api_key` and `typesense_api_key` raises `ValueError`.
-
-### Constructor options
-
-```python
-TypesenseVectorStore(
-    client,
-    embedding,
-    *,
-    collection_name="langchain-typesense",
-    async_client=None,
-    text_key="text",
-    vector_key="vec",
-    metadata_key="metadata",
-    index_metadata=True,
-)
-```
-
-`text_key`, `vector_key`, and `metadata_key` must be non-empty, distinct, and different
-from Typesense's reserved `id` field. These names must match an existing collection if
-one is reused.
+`from_texts` and LangChain's `from_documents` are available for small one-step setups.
+For application lifecycle control, constructing the store explicitly and then calling
+`add_documents` or `aadd_documents` is clearer. Mixed document IDs are supported: an
+explicit `ids` sequence must match the document count; otherwise each `Document.id` is
+used when present and a UUID is generated for an item without one.
 
 ## Collection schema and metadata
 
-The managed collection schema is based on the first embedding dimension:
+By default, a new collection has this shape (field names are configurable):
 
 ```text
 enable_nested_fields: true
 
-text       string
-vec        float[]  (num_dim=<embedding dimension>, vec_dist=cosine)
-metadata   object   (optional, indexed by default)
+text     string
+vec      float[]  (num_dim=<embedding dimension>, vec_dist=<cosine or ip>)
+metadata object   (indexed by default)
 ```
 
-Field names shown above are defaults and can be changed with constructor options.
-Metadata is stored under one nested object, preventing metadata keys such as `id`,
-`text`, or `vec` from overwriting managed Typesense fields. Returned LangChain
-`Document` objects contain the nested values in `Document.metadata` and retain the
-Typesense document ID in `Document.id`.
+`Document.page_content` is stored in `text`, the embedding in `vec`, and LangChain
+metadata under the nested `metadata` object. The Typesense document ID is preserved as
+`Document.id`. Nesting keeps metadata keys from colliding with managed fields.
 
-Set `index_metadata=False` when metadata only needs to be stored and returned:
+Set `index_metadata=False` when metadata only needs to be stored and returned. Dictionary
+metadata filters require indexed metadata, and this option affects newly created
+collections only. It does not alter an existing schema.
 
-```python
-store = TypesenseVectorStore(
-    client=client,
-    embedding=embeddings,
-    collection_name="unfiltered-documents",
-    index_metadata=False,
-)
-```
+The configured field names must be non-empty, distinct, and different from Typesense's
+reserved `id` field. Reusing a collection requires matching text type, vector dimension,
+vector distance, metadata object type, nested-field support, and metadata indexing (when
+enabled). An incompatible collection raises `TypesenseCollectionError`.
 
-Dictionary metadata filters require indexed metadata. The setting affects newly
-created collections; it does not rewrite an existing schema.
+Keep the embedding model and vector dimension stable for a collection. A dimension or
+distance change requires a new compatible collection and reindexing.
 
-For an existing collection, the integration validates:
-
-- text field type
-- vector field type and dimension
-- cosine distance
-- metadata object type
-- nested-field support
-- metadata indexing when `index_metadata=True`
-
-An incompatible collection raises `TypesenseCollectionError` before import. A
-collection creation race is handled by retrieving and validating the collection created
-by the competing process.
-
-### Document IDs and upserts
-
-`add_documents` resolves IDs in this order:
-
-1. Explicit `ids=` values
-2. Each `Document.id`
-3. Generated UUIDs
-
-Explicit IDs must have the same count as the documents. IDs must be non-empty and use
-only URL-unreserved characters: letters, digits, `-`, `.`, `_`, and `~`. Reusing an ID
-upserts that Typesense document. The input `Document` objects are not mutated.
-
-## Add and update data
-
-### Documents
+## Writing documents
 
 ```python
 ids = store.add_documents(
     [
         Document(id="doc-1", page_content="First", metadata={"group": "a"}),
-        Document(id="doc-2", page_content="Second", metadata={"group": "b"}),
+        Document(page_content="Second", metadata={"group": "b"}),
     ],
     batch_size=100,
 )
 ```
 
-`add_documents(documents, *, ids=None, batch_size=None)` embeds all document text,
-creates or validates the collection, bulk-upserts the records, checks each Typesense
-import result, and returns the resolved IDs. `batch_size` must be greater than zero when
-provided and is passed to the Typesense import operation.
+`add_documents` embeds all content, creates or validates the collection, bulk-upserts
+documents, checks every Typesense import result, and returns resolved IDs. `add_texts`
+converts strings to documents; both methods have asynchronous `aadd_*` equivalents.
 
-`aadd_documents` has the same arguments and return value. With an async client, it uses
-`aembed_documents` and native async Typesense calls.
+IDs must be non-empty and contain only URL-unreserved characters (`A-Z`, `a-z`, digits,
+`-`, `.`, `_`, or `~`). Reusing an ID upserts that document. Empty input returns an empty
+list without creating a collection or calling the embedding model.
 
-### Texts
-
-```python
-ids = store.add_texts(
-    ["First", "Second"],
-    metadatas=[{"group": "a"}, {"group": "b"}],
-    ids=["doc-1", "doc-2"],
-    batch_size=100,
-)
-```
-
-`add_texts(texts, metadatas=None, *, ids=None, **add_options)` converts strings to
-`Document` objects and delegates to `add_documents`. `aadd_texts` is its asynchronous
-equivalent. Metadata and ID counts must match the number of texts.
-
-Empty input returns an empty list without creating a collection or calling the embedding
-model. Supplying non-empty IDs for empty input raises `ValueError`.
-
-### One-step constructors
-
-`from_texts` creates a store using a required existing sync client, inserts the texts,
-and returns the store:
-
-```python
-store = TypesenseVectorStore.from_texts(
-    ["First", "Second"],
-    embeddings,
-    metadatas=[{"group": "a"}, {"group": "b"}],
-    ids=["doc-1", "doc-2"],
-    client=client,
-    async_client=async_client,
-    collection_name="my-documents",
-)
-```
-
-The inherited LangChain `from_documents` constructor delegates to `from_texts`, so it
-also requires `client=...`. The inherited `afrom_texts` and `afrom_documents`
-constructors run this one-step synchronous construction in a worker executor. For
-native asynchronous ingestion, construct the store with `async_client` and call
-`aadd_texts` or `aadd_documents` directly.
+Typesense bulk import can partially succeed while returning HTTP success. A rejected
+record raises `TypesenseImportError`; successful records are not rolled back. Inspect
+the exception's `.failures` tuple and retry or reconcile only the rejected records.
 
 ## Similarity search
 
-All searches are pure vector searches (`q="*"`). Text-query methods embed the query;
-by-vector methods use the supplied embedding directly.
+Text searches embed the query. By-vector methods use the supplied embedding directly.
+All methods perform vector search with `q="*"`; see the
+[Typesense 30.2 vector-search documentation](https://typesense.org/docs/30.2/api/vector-search.html)
+for server-side vector options:
 
 ```python
 documents = store.similarity_search("release notes", k=4)
-
-documents_and_distance = store.similarity_search_with_score(
-    "release notes",
-    k=4,
-)
+documents_and_distances = store.similarity_search_with_score("release notes", k=4)
 
 query_vector = embeddings.embed_query("release notes")
 documents = store.similarity_search_by_vector(query_vector, k=4)
 ```
 
-Asynchronous equivalents are `asimilarity_search`,
-`asimilarity_search_with_score`, and `asimilarity_search_by_vector`.
+Async equivalents are `asimilarity_search`, `asimilarity_search_with_score`, and
+`asimilarity_search_by_vector`. `k` defaults to 4 and must be non-negative; zero returns
+an empty list. A missing collection is reported by the Typesense client.
 
-`k` defaults to `4`, must be non-negative, and returns at most that many documents. A
-zero value returns an empty list. Searching a collection that does not exist also
-returns an empty list.
-
-### Distance and relevance scores
-
-`similarity_search_with_score` and `asimilarity_search_with_score` return
-`(Document, distance)` pairs using raw Typesense cosine distance:
-
-- `0` means identical direction and is best.
-- `2` is the maximum cosine distance and is worst.
-- Smaller values are more similar.
-
-LangChain's inherited `similarity_search_with_relevance_scores` and async equivalent
-return `(Document, relevance)` pairs. This integration converts distance with:
+`*_with_score` returns the raw Typesense vector distance, where lower is better. With
+cosine distance, identical vectors have distance 0 and the maximum is 2. LangChain's
+`similarity_search_with_relevance_scores` converts cosine distance to a bounded score:
 
 ```text
 relevance = clamp(1 - distance / 2, 0, 1)
 ```
 
-The resulting range is `[0, 1]`, where `1` is most relevant. Use LangChain's
-`score_threshold` to post-filter this normalized score:
+Use `score_threshold` with normalized relevance, or `distance_threshold` with raw
+Typesense distance; they are not interchangeable. Inner-product (`vec_dist="ip"`)
+search returns raw distances but does not provide bounded relevance scores or local
+cosine-based MMR.
 
-```python
-matches = store.similarity_search_with_relevance_scores(
-    "release notes",
-    k=10,
-    score_threshold=0.8,
-)
-```
+### Filters and search options
 
-`score_threshold` and `distance_threshold` use opposite scales and are not
-interchangeable: `score_threshold` is a minimum normalized relevance applied by
-LangChain, while `distance_threshold` is a maximum raw vector distance sent to
-Typesense.
-
-## Filters
-
-Dictionary filters provide equality matching against nested metadata:
+Dictionary filters target nested metadata and combine entries with `&&`:
 
 ```python
 matches = store.similarity_search(
     "release notes",
     k=8,
-    filter={
-        "source": "docs",
-        "year": 2026,
-        "published": True,
-        "category": ["guide", "reference"],
-    },
+    filter={"source": "docs", "year": 2026, "published": True},
 )
 ```
 
-Mapping entries are combined with `&&`. Scalar values use exact equality. A sequence
-produces a Typesense list equality filter. Mapping keys may contain letters, digits,
-underscores, hyphens, and dots, and must start with a letter or underscore. Values can
-be strings, integers, finite floats, or booleans.
-
-Pass a raw Typesense `filter_by` expression for ranges, boolean logic, geospatial
-filters, or fields managed outside the nested metadata object:
+Use a raw Typesense `filter_by` expression for ranges or more advanced logic. The
+[Typesense 30.2 search documentation](https://typesense.org/docs/30.2/api/search.html)
+defines the filter syntax:
 
 ```python
 matches = store.similarity_search(
@@ -416,42 +248,34 @@ matches = store.similarity_search(
 )
 ```
 
-Raw strings are passed through unchanged. Treat them as trusted query syntax; validate
-or construct them safely before accepting user-controlled input.
+Raw filter strings are trusted Typesense syntax. Validate or construct them safely when
+values come from users.
 
-## Typesense search tuning
-
-Every similarity and MMR method accepts the following Typesense-specific options:
-
-- `distance_threshold`: finite, non-negative maximum cosine distance
-- `ef`: positive HNSW candidate-list size
-- `flat_search_cutoff`: non-negative cutoff for flat vector search
-- `search_parameters`: additional Typesense document-search parameters
-- `filter`: dictionary metadata filter or raw Typesense expression
-
-Example:
+Vector-search tuning options include `distance_threshold`, `ef`, and
+`flat_search_cutoff`. `search_parameters` provides a typed way to pass additional
+Typesense options, for example:
 
 ```python
 matches = store.similarity_search(
     "release notes",
     k=8,
-    filter={"source": "docs"},
-    distance_threshold=0.35,
     ef=100,
-    flat_search_cutoff=20,
     search_parameters={"enable_lazy_filter": True},
 )
 ```
 
 The integration owns `q`, `vector_query`, `per_page`, `page`, `filter_by`, and
-`exclude_fields`. Supplying any of these names through `search_parameters` raises
-`ValueError`. Unsupported keyword options raise `TypeError` instead of being silently
+`exclude_fields`; those names cannot be overridden. Other options that change the
+response shape, ranking semantics, pagination, or required fields are rejected so
+results remain parseable and `k` remains meaningful. The explicit `curation_tags` and
+`diversity_lambda` options are the exception: they allow configured Typesense curations
+to reorder results. Unsupported keyword arguments are rejected instead of silently
 ignored.
 
 ## Maximal marginal relevance
 
-MMR first fetches nearest candidates, including their vectors, and then uses LangChain's
-MMR implementation to balance similarity against diversity:
+MMR fetches vector candidates and reranks them in the application process using
+LangChain's cosine-based implementation:
 
 ```python
 documents = store.max_marginal_relevance_search(
@@ -463,119 +287,46 @@ documents = store.max_marginal_relevance_search(
 )
 ```
 
-Available methods are:
+`k` defaults to 4, `fetch_k` to 20, and `lambda_mult` to 0.5. Counts must be
+non-negative; `lambda_mult` must be between 0 and 1. The by-vector and async variants
+are available. MMR requires `vec_dist="cosine"`; use Typesense's own server-side
+curation when centralized diversity rules or avoiding vector transfer is more important.
 
-- `max_marginal_relevance_search`
-- `max_marginal_relevance_search_by_vector`
-- `amax_marginal_relevance_search`
-- `amax_marginal_relevance_search_by_vector`
-
-`k` defaults to `4`, `fetch_k` to `20`, and `lambda_mult` to `0.5`. The store requests
-`max(k, fetch_k)` candidates. `lambda_mult=1` favors similarity; `lambda_mult=0` favors
-diversity. Both counts must be non-negative, and `lambda_mult` must be in `[0, 1]`.
-Passing zero for either count returns an empty list.
-
-## Retrieve and delete by ID
+## Retrieve, delete, and manage collections
 
 ```python
 documents = store.get_by_ids(["doc-1", "missing", "doc-2"])
-documents = await store.aget_by_ids(["doc-1", "doc-2"])
-
 store.delete(ids=["doc-1", "doc-2"])
-await store.adelete(ids=["doc-3"])
+
+store.create_collection(num_dim=1536)  # create or validate
+deleted = store.delete_collection()  # False when already absent
 ```
 
-`get_by_ids` and `aget_by_ids` ignore missing IDs and retrieve duplicate requested IDs
-only once. Callers must not assume the number of returned documents matches the number
-of requested IDs.
+`get_by_ids` ignores missing IDs and returns each requested ID at most once; the result
+count need not equal the request count. `delete(ids=[])` is a no-op. Bare `delete()` is
+rejected; clearing all documents requires `delete(allow_delete_all=True)`, which keeps
+the collection schema. `delete_collection()` removes the collection. Async equivalents
+are available for each operation.
 
-`delete(ids=[...])` bulk-deletes selected documents. `delete(ids=[])` is a successful
-no-op. `delete()` with no IDs truncates every document but preserves the collection and
-schema. `delete` and `adelete` return `True`; deleting from a missing collection is also
-treated as successful.
+## Use as a retriever
 
-## Collection lifecycle and cleanup
-
-Collection management is explicit when needed:
-
-```python
-store.create_collection(num_dim=1536)          # create or validate
-await store.acreate_collection(num_dim=1536)
-
-deleted = store.delete_collection()            # False if already absent
-deleted = await store.adelete_collection()
-```
-
-Use `delete()` to clear documents while retaining the schema. Use
-`delete_collection()` to remove the collection itself. Client cleanup is separate:
-
-```python
-store.close()
-# or, when an async client was supplied:
-await store.aclose()
-```
-
-## Use as a LangChain retriever
-
-Because the class implements LangChain's `VectorStore` contract, it can be converted to
-a retriever:
+The store follows LangChain's `VectorStore` contract:
 
 ```python
 retriever = store.as_retriever(
     search_type="similarity_score_threshold",
-    search_kwargs={
-        "k": 8,
-        "score_threshold": 0.75,
-        "filter": {"source": "docs"},
-    },
+    search_kwargs={"k": 8, "score_threshold": 0.75},
 )
-
 documents = retriever.invoke("release notes")
 ```
 
-Supported LangChain search types are `similarity`, `mmr`, and
-`similarity_score_threshold`. The same choices are available through inherited `search`
-and `asearch` methods.
+LangChain search types are `similarity`, `mmr`, and
+`similarity_score_threshold`. The inherited `search` and `asearch` helpers are also
+available.
 
-## Public API summary
+## Errors
 
-### Properties
-
-- `client`: configured synchronous Typesense client
-- `async_client`: configured async client, or `None`
-- `collection_name`: backing collection name
-- `embeddings`: configured LangChain embedding model
-
-### Construction and lifecycle
-
-- `TypesenseVectorStore(...)`
-- `from_client_params(...)`
-- `from_texts(...)` and inherited `from_documents(...)`
-- inherited `afrom_texts(...)` and `afrom_documents(...)`
-- `create_collection(...)` and `acreate_collection(...)`
-- `delete_collection()` and `adelete_collection()`
-- `close()` and `aclose()`
-
-### Writes, reads, and deletes
-
-- `add_documents(...)` and `aadd_documents(...)`
-- `add_texts(...)` and `aadd_texts(...)`
-- `get_by_ids(...)` and `aget_by_ids(...)`
-- `delete(...)` and `adelete(...)`
-
-### Search
-
-- `similarity_search(...)` and `asimilarity_search(...)`
-- `similarity_search_with_score(...)` and `asimilarity_search_with_score(...)`
-- `similarity_search_by_vector(...)` and `asimilarity_search_by_vector(...)`
-- inherited `similarity_search_with_relevance_scores(...)` and async equivalent
-- `max_marginal_relevance_search(...)` and async equivalent
-- `max_marginal_relevance_search_by_vector(...)` and async equivalent
-- inherited `search(...)`, `asearch(...)`, and `as_retriever(...)`
-
-## Error handling
-
-All integration-defined errors inherit from `TypesenseVectorStoreError`:
+Integration-defined errors are exported from `langchain_typesense`:
 
 ```python
 from langchain_typesense import (
@@ -585,69 +336,15 @@ from langchain_typesense import (
 )
 ```
 
-- `TypesenseCollectionError` reports incompatible schemas or malformed stored
-  documents.
-- `TypesenseImportError` reports one or more rejected bulk-import records. Its
-  `.failures` attribute is a tuple containing copies of Typesense's failure records.
-- `TypesenseVectorStoreError` reports malformed or unexpected import/search responses
-  and other integration-level failures.
+- `TypesenseCollectionError`: incompatible schema or malformed stored document.
+- `TypesenseImportError`: one or more records rejected by bulk import; inspect
+  `.failures`.
+- `TypesenseVectorStoreError`: malformed or unexpected Typesense response.
 
-Typesense's bulk import endpoint can return HTTP success while rejecting individual
-records. This integration validates every returned result and raises
-`TypesenseImportError` when any record failed:
-
-```python
-from langchain_typesense import TypesenseImportError
-
-try:
-    store.add_documents(documents, ids=ids)
-except TypesenseImportError as error:
-    for failure in error.failures:
-        print(failure.get("code"), failure.get("error"), failure.get("document"))
-```
-
-Typesense does not roll back successful records in a partially failed batch. Recovery
-logic should inspect `.failures` and reconcile or retry only rejected IDs. Network,
-authentication, and other Typesense client exceptions propagate from the Typesense
-client. Invalid local arguments raise `ValueError` or `TypeError` before a request where
-possible.
-
-## Troubleshooting
-
-### Deprecation warnings from `typesense-python` 2.0.0
-
-Tests may report warnings such as:
-
-```text
-DeprecationWarning: SyncAnalyticsV1 is deprecated on v30+.
-```
-
-`typesense-python` 2.0.0 eagerly instantiates deprecated analytics compatibility
-objects while constructing a client, and deprecated overrides and synonyms objects
-while constructing a collection handle. `langchain-typesense` does not call those APIs;
-it uses current collection and document operations. These warnings are advisory and
-originate in the upstream client, so passing integration tests do not indicate use of a
-deprecated vector-store operation.
-
-## Production guidance
-
-- Keep the embedding model and output dimension stable for the lifetime of a
-  collection. A dimension change requires a compatible new collection and reindex.
-- Use explicit, stable IDs when writes may be retried; imports use upsert semantics.
-- Reuse configured clients instead of creating a client per request, then close their
-  HTTP resources during application shutdown.
-- Supply `async_client` in async services to avoid worker-thread fallback.
-- Keep metadata indexed only when filters need it. Validate filter behavior against the
-  production Typesense schema.
-- Handle `TypesenseImportError` as partial success, not as an atomic transaction
-  failure.
-- Use least-privilege Typesense API keys and do not commit keys to source control.
-- Test collection-schema compatibility and representative searches before switching an
-  existing production collection.
+Typesense client and embedding exceptions propagate unchanged, so callers can handle
+authentication, network, and provider failures using their original exception types.
 
 ## Migrating from `langchain-community`
-
-Change the import and preferred class name:
 
 ```python
 # Before
@@ -657,51 +354,29 @@ from langchain_community.vectorstores import Typesense
 from langchain_typesense import TypesenseVectorStore
 ```
 
-`Typesense` remains an alias for `TypesenseVectorStore`:
+`Typesense` remains an alias. The main constructor changes are:
 
-```python
-from langchain_typesense import Typesense
-```
+- `typesense_client` → `client`
+- `typesense_collection_name` → `collection_name`
+- `typesense_url` and `api_key` are used by `from_client_params`
+- `async_client` enables native async I/O
+- `index_metadata` controls indexing for new collections
 
-Constructor changes:
-
-- `typesense_client` becomes `client`.
-- `typesense_collection_name` becomes `collection_name`.
-- `text_key` remains supported.
-- `vector_key="vec"` and `metadata_key="metadata"` are now configurable.
-- `async_client` enables native async Typesense operations.
-- `index_metadata` controls indexing when creating the collection.
-- `from_client_params` accepts preferred `api_key` and legacy
-  `typesense_api_key` names.
-
-Behavioral changes:
-
-- Search `k` now defaults to LangChain's standard value of `4`, rather than `10`.
-- `Document.id` is preserved on reads and used on writes when explicit `ids` are absent.
-- Existing collections are validated before import.
-- Metadata has a managed nested object schema with nested fields enabled.
-- Bulk-import partial failures raise `TypesenseImportError`.
-- Dictionary metadata filters, by-vector search, relevance scoring, MMR, ID lookup,
-  deletion, and native async methods are available.
-- Unknown options are rejected instead of silently ignored.
-
-The archived integration created collections with a dynamic wildcard field and did not
-explicitly enable the new managed nested schema. Do not assume such a collection is
-compatible. The safest migration is to create a new collection with this integration,
-re-embed or copy source documents into it, validate search and filters, and then switch
-application traffic. An existing collection can be reused only when it passes the
-schema checks described above. Back up production data before migration.
+This integration uses a managed nested metadata schema, validates existing collections,
+preserves `Document.id`, rejects unknown options, and reports partial import failures.
+An old collection is reusable only if it passes schema validation; otherwise create a
+new collection, reindex source documents, validate representative searches, and switch
+traffic after verification.
 
 ## Development
 
-Install `uv`, clone the repository, and install every dependency group:
+Install `uv`, then install all dependency groups:
 
 ```bash
 uv sync --all-groups
 ```
 
-Run formatting, linting, both static type checkers, unit tests, and package builds.
-`make lint` runs Ruff, mypy, and ty:
+Run formatting, linting, type checks, tests, and builds:
 
 ```bash
 make format
@@ -710,13 +385,13 @@ make test
 make build
 ```
 
-Unit tests block network access and use mocked Typesense clients:
+Unit tests block network access:
 
 ```bash
 uv run --group test pytest --disable-socket --allow-unix-socket tests/unit_tests/
 ```
 
-Start Typesense and run the real LangChain contract suite:
+Run integration tests against local Typesense:
 
 ```bash
 docker compose up -d
@@ -724,11 +399,6 @@ make integration_test
 docker compose down
 ```
 
-Integration tests create a unique collection per test, exercise LangChain's standard
-sync and async `VectorStoreIntegrationTests`, run package-specific filter and relevance
-assertions, and delete their collections during fixture cleanup. `langchain-tests` is
-pinned because minor releases can add new contract assertions.
-
-CI runs on pushes to `main` and pull requests. Quality jobs cover Python 3.10 and 3.14,
-including Ruff, formatting, static typing, unit tests, and distribution builds. A
-separate Python 3.12 job starts Typesense 30.2 and executes the real integration suite.
+The integration suite uses a unique collection per test and removes those collections
+during cleanup. `langchain-tests` is pinned because contract assertions can change in
+minor releases.

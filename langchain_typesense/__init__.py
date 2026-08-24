@@ -1,11 +1,14 @@
 from importlib import metadata
 
 from langchain_typesense.vectorstores import (
+    ClientMode,
     Typesense,
     TypesenseCollectionError,
     TypesenseImportError,
+    TypesenseSearchParameters,
     TypesenseVectorStore,
     TypesenseVectorStoreError,
+    VectorDistance,
 )
 
 try:
@@ -15,10 +18,13 @@ except metadata.PackageNotFoundError:
     __version__ = ""
 
 __all__ = [
+    "ClientMode",
     "Typesense",
     "TypesenseCollectionError",
     "TypesenseImportError",
+    "TypesenseSearchParameters",
     "TypesenseVectorStore",
     "TypesenseVectorStoreError",
+    "VectorDistance",
     "__version__",
 ]
