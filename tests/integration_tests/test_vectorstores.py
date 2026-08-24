@@ -47,7 +47,7 @@ class HardcodedEmbeddings(Embeddings):
 def client_config() -> ConfigDict:
     """Return the local integration-test Typesense configuration."""
     return {
-        "nodes": [{"host": "localhost", "port": 8108, "protocol": "http"}],
+        "nodes": ["http://localhost:8108"],
         "api_key": "xyz",
         "connection_timeout_seconds": 2,
     }
@@ -161,9 +161,9 @@ class TestHardcodedTypesenseMethods:
 
         assert [document.id for document in store.get_by_ids(["near", "missing"])] == ["near"]
         assert store.delete(["near"]) is True
-        with pytest.raises(ValueError, match="allow_delete_all"):
+        with pytest.raises(ValueError, match="delete_all_documents"):
             store.delete()
-        assert store.delete(allow_delete_all=True) is True
+        assert store.delete(delete_all_documents=True) is True
         assert store.similarity_search("alpha") == []
 
     async def test_native_async_add_search_mmr_get_and_delete(
@@ -196,7 +196,7 @@ class TestHardcodedTypesenseMethods:
         ] == ids
         assert [document.id for document in await store.aget_by_ids(ids)] == ids
         assert await store.adelete(["opposite"]) is True
-        assert await store.adelete(allow_delete_all=True) is True
+        assert await store.adelete(delete_all_documents=True) is True
 
     async def test_async_only_client_and_missing_collection_error(self) -> None:
         config = client_config()
@@ -216,6 +216,38 @@ class TestHardcodedTypesenseMethods:
             with pytest.raises(ObjectNotFound):
                 await store.asimilarity_search("alpha")
         finally:
+            await store.aclose()
+
+    async def test_async_factory_and_custom_field_names(self) -> None:
+        config = client_config()
+        collection_name = f"langchain-typesense-custom-{uuid4()}"
+        store = await TypesenseVectorStore.afrom_documents(
+            [Document(id="alpha", page_content="alpha", metadata={"source": "docs"})],
+            HardcodedEmbeddings(),
+            client=None,
+            async_client=typesense.AsyncClient(config),
+            collection_name=collection_name,
+            text_key="body",
+            vector_key="embedding",
+            metadata_key="attributes",
+        )
+        try:
+            assert await store.asimilarity_search("alpha", k=1, filter={"source": "docs"}) == [
+                Document(
+                    id="alpha",
+                    page_content="alpha",
+                    metadata={"source": "docs"},
+                )
+            ]
+            assert await store.aget_by_ids(["missing", "alpha", "alpha"]) == [
+                Document(
+                    id="alpha",
+                    page_content="alpha",
+                    metadata={"source": "docs"},
+                )
+            ]
+        finally:
+            await store.adelete_collection()
             await store.aclose()
 
     def test_from_texts_one_step_contract(self) -> None:

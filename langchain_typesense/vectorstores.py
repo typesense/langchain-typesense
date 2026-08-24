@@ -16,6 +16,7 @@ application.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import uuid
@@ -705,13 +706,19 @@ class TypesenseVectorStore(VectorStore):
         try:
             schema = client.collections[self._collection_name].retrieve()
         except ObjectNotFound:
-            try:
-                client.collections.create(self._collection_schema(num_dim))
-                self._sync_validated_num_dim = num_dim
-                return
-            except ObjectAlreadyExists:
-                schema = client.collections[self._collection_name].retrieve()
+            self._create_missing_collection(num_dim)
+            return
         self._validate_collection_schema(schema, num_dim)
+        self._sync_validated_num_dim = num_dim
+
+    def _create_missing_collection(self, num_dim: int) -> None:
+        """Create a collection already known to be missing, handling a creator race."""
+        client = self._require_sync_client()
+        try:
+            client.collections.create(self._collection_schema(num_dim))
+        except ObjectAlreadyExists:
+            schema = client.collections[self._collection_name].retrieve()
+            self._validate_collection_schema(schema, num_dim)
         self._sync_validated_num_dim = num_dim
 
     async def acreate_collection(self, num_dim: int) -> None:
@@ -737,13 +744,20 @@ class TypesenseVectorStore(VectorStore):
         try:
             schema = await self._async_client.collections[self._collection_name].retrieve()
         except ObjectNotFound:
-            try:
-                await self._async_client.collections.create(self._collection_schema(num_dim))
-                self._async_validated_num_dim = num_dim
-                return
-            except ObjectAlreadyExists:
-                schema = await self._async_client.collections[self._collection_name].retrieve()
+            await self._acreate_missing_collection(num_dim)
+            return
         self._validate_collection_schema(schema, num_dim)
+        self._async_validated_num_dim = num_dim
+
+    async def _acreate_missing_collection(self, num_dim: int) -> None:
+        """Asynchronously create a known-missing collection, handling a creator race."""
+        if self._async_client is None:  # pragma: no cover - internal native-async helper
+            raise RuntimeError("An asynchronous Typesense client is required.")
+        try:
+            await self._async_client.collections.create(self._collection_schema(num_dim))
+        except ObjectAlreadyExists:
+            schema = await self._async_client.collections[self._collection_name].retrieve()
+            self._validate_collection_schema(schema, num_dim)
         self._async_validated_num_dim = num_dim
 
     def delete_collection(self) -> bool:
@@ -832,7 +846,7 @@ class TypesenseVectorStore(VectorStore):
             # Recover if the collection was removed after this store cached its
             # schema validation.
             self._sync_validated_num_dim = None
-            self.create_collection(num_dim)
+            self._create_missing_collection(num_dim)
             response = documents_api.import_(payload, import_parameters, batch_size=batch_size)
         self._raise_for_import_failures(response)
         return resolved_ids
@@ -920,7 +934,7 @@ class TypesenseVectorStore(VectorStore):
             )
         except ObjectNotFound:
             self._async_validated_num_dim = None
-            await self.acreate_collection(num_dim)
+            await self._acreate_missing_collection(num_dim)
             response = await documents_api.import_(
                 payload, import_parameters, batch_size=batch_size
             )
@@ -1455,7 +1469,7 @@ class TypesenseVectorStore(VectorStore):
             return []
         results = self._search_by_vector(
             embedding,
-            max(k, fetch_k),
+            fetch_k,
             filter=filter,
             search_parameters=search_parameters,
             distance_threshold=distance_threshold,
@@ -1565,7 +1579,7 @@ class TypesenseVectorStore(VectorStore):
             return []
         results = await self._asearch_by_vector(
             embedding,
-            max(k, fetch_k),
+            fetch_k,
             filter=filter,
             search_parameters=search_parameters,
             distance_threshold=distance_threshold,
@@ -1607,6 +1621,44 @@ class TypesenseVectorStore(VectorStore):
         metadata.update(raw_metadata)
         return Document(id=document_id, page_content=page_content, metadata=metadata)
 
+    @staticmethod
+    def _parse_export_response(response: object) -> list[Mapping[str, Any]]:
+        """Parse the JSONL returned by Typesense's document export endpoint."""
+        if not isinstance(response, str):
+            raise TypesenseVectorStoreError(
+                "Typesense returned an unexpected document export response."
+            )
+        documents: list[Mapping[str, Any]] = []
+        for line_number, line in enumerate(response.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise TypesenseVectorStoreError(
+                    f"Typesense returned invalid JSON on export line {line_number}."
+                ) from error
+            if not isinstance(raw, Mapping):
+                raise TypesenseVectorStoreError(
+                    f"Typesense returned a non-object on export line {line_number}."
+                )
+            documents.append(raw)
+        return documents
+
+    def _documents_in_requested_order(
+        self,
+        raw_documents: Sequence[Mapping[str, Any]],
+        ids: Sequence[str],
+    ) -> list[Document]:
+        """Deserialize exported documents and retain the caller's first-seen order."""
+        requested = dict.fromkeys(ids)
+        by_id: dict[str, Document] = {}
+        for raw in raw_documents:
+            document = self._document_from_typesense(raw)
+            if document.id in requested and document.id not in by_id:
+                by_id[document.id] = document
+        return [by_id[document_id] for document_id in requested if document_id in by_id]
+
     def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
         """Return found documents for the supplied IDs.
 
@@ -1623,19 +1675,13 @@ class TypesenseVectorStore(VectorStore):
         """
         if not ids:
             return []
-        documents: list[Document] = []
-        collection = self._require_sync_client().collections[self._collection_name]
-        # A collection-level check lets us distinguish a missing collection (an
-        # operational error) from individual missing IDs (part of this contract).
-        collection.retrieve()
-        for document_id in dict.fromkeys(ids):
-            self._validate_id(document_id)
-            try:
-                raw = collection.documents[document_id].retrieve()
-            except ObjectNotFound:
-                continue
-            documents.append(self._document_from_typesense(raw))
-        return documents
+        unique_ids = list(dict.fromkeys(ids))
+        response = (
+            self._require_sync_client()
+            .collections[self._collection_name]
+            .documents.export({"filter_by": self._ids_filter(unique_ids)})
+        )
+        return self._documents_in_requested_order(self._parse_export_response(response), unique_ids)
 
     async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
         """Asynchronously return found documents for the supplied IDs.
@@ -1647,17 +1693,11 @@ class TypesenseVectorStore(VectorStore):
             return await run_in_executor(None, self.get_by_ids, ids)
         if not ids:
             return []
-        documents: list[Document] = []
-        collection = self._async_client.collections[self._collection_name]
-        await collection.retrieve()
-        for document_id in dict.fromkeys(ids):
-            self._validate_id(document_id)
-            try:
-                raw = await collection.documents[document_id].retrieve()
-            except ObjectNotFound:
-                continue
-            documents.append(self._document_from_typesense(raw))
-        return documents
+        unique_ids = list(dict.fromkeys(ids))
+        response = await self._async_client.collections[self._collection_name].documents.export(
+            {"filter_by": self._ids_filter(unique_ids)}
+        )
+        return self._documents_in_requested_order(self._parse_export_response(response), unique_ids)
 
     @classmethod
     def _ids_filter(cls, ids: Sequence[str]) -> str:
@@ -1670,15 +1710,15 @@ class TypesenseVectorStore(VectorStore):
         self,
         ids: list[str] | None = None,
         *,
-        allow_delete_all: bool = False,
+        delete_all_documents: bool = False,
         **kwargs: Any,
     ) -> bool:
         """Delete selected documents, with an explicit guard for truncation.
 
         Args:
             ids: IDs to delete. An empty list is a no-op. ``None`` requires
-                ``allow_delete_all=True`` and truncates every document.
-            allow_delete_all: Explicit confirmation for collection truncation.
+                ``delete_all_documents=True`` and truncates every document.
+            delete_all_documents: Explicit confirmation for collection truncation.
 
         Returns:
             ``True`` after a successful request.
@@ -1687,13 +1727,13 @@ class TypesenseVectorStore(VectorStore):
             raise TypeError(f"Unsupported delete options: {', '.join(sorted(kwargs))}")
         parameters: DeleteQueryParameters
         if ids is None:
-            if not allow_delete_all:
+            if not delete_all_documents:
                 raise ValueError(
-                    "Refusing to delete every document without `allow_delete_all=True`."
+                    "Refusing to delete every document without `delete_all_documents=True`."
                 )
             parameters = {"truncate": True}
-        elif allow_delete_all:
-            raise ValueError("`allow_delete_all` cannot be combined with explicit IDs.")
+        elif delete_all_documents:
+            raise ValueError("`delete_all_documents` cannot be combined with explicit IDs.")
         elif not ids:
             return True
         else:
@@ -1705,7 +1745,7 @@ class TypesenseVectorStore(VectorStore):
         self,
         ids: list[str] | None = None,
         *,
-        allow_delete_all: bool = False,
+        delete_all_documents: bool = False,
         **kwargs: Any,
     ) -> bool:
         """Asynchronously delete documents, with guarded truncation.
@@ -1717,16 +1757,21 @@ class TypesenseVectorStore(VectorStore):
         if kwargs:
             raise TypeError(f"Unsupported delete options: {', '.join(sorted(kwargs))}")
         if self._async_client is None:
-            return await run_in_executor(None, self.delete, ids, allow_delete_all=allow_delete_all)
+            return await run_in_executor(
+                None,
+                self.delete,
+                ids,
+                delete_all_documents=delete_all_documents,
+            )
         parameters: DeleteQueryParameters
         if ids is None:
-            if not allow_delete_all:
+            if not delete_all_documents:
                 raise ValueError(
-                    "Refusing to delete every document without `allow_delete_all=True`."
+                    "Refusing to delete every document without `delete_all_documents=True`."
                 )
             parameters = {"truncate": True}
-        elif allow_delete_all:
-            raise ValueError("`allow_delete_all` cannot be combined with explicit IDs.")
+        elif delete_all_documents:
+            raise ValueError("`delete_all_documents` cannot be combined with explicit IDs.")
         elif not ids:
             return True
         else:
@@ -1786,8 +1831,9 @@ class TypesenseVectorStore(VectorStore):
 
         Args:
             embedding: Embedding model used by the returned store.
-            typesense_url: Absolute Typesense HTTP(S) URL. The standard port is
-                inferred when omitted.
+            typesense_url: Absolute Typesense HTTP(S) URL. Port 80 is inferred for
+                HTTP and port 443 for HTTPS when the URL omits a port. An explicit
+                port is preserved.
             api_key: Typesense API key.
             client_mode: Create a sync client (the default), async client, or both.
             connection_timeout_seconds: Client request timeout.
@@ -1871,6 +1917,42 @@ class TypesenseVectorStore(VectorStore):
             if any(document_ids):
                 kwargs["ids"] = [document_id or str(uuid.uuid4()) for document_id in document_ids]
         return await cls.afrom_texts(texts, embedding, metadatas=metadatas, **kwargs)
+
+    @classmethod
+    async def afrom_texts(
+        cls,
+        texts: list[str],
+        embedding: Embeddings,
+        metadatas: list[dict[str, Any]] | None = None,
+        *,
+        ids: list[str] | None = None,
+        client: Client | None = None,
+        async_client: AsyncClient | None = None,
+        collection_name: str = DEFAULT_COLLECTION_NAME,
+        text_key: str = DEFAULT_TEXT_KEY,
+        vector_key: str = DEFAULT_VECTOR_KEY,
+        metadata_key: str = DEFAULT_METADATA_KEY,
+        index_metadata: bool = True,
+        vec_dist: VectorDistance = "cosine",
+        batch_size: int | None = None,
+        **kwargs: Any,
+    ) -> TypesenseVectorStore:
+        """Create a store and add texts using native async I/O when available."""
+        if kwargs:
+            raise TypeError(f"Unsupported constructor options: {', '.join(sorted(kwargs))}")
+        store = cls(
+            client=client,
+            async_client=async_client,
+            embedding=embedding,
+            collection_name=collection_name,
+            text_key=text_key,
+            vector_key=vector_key,
+            metadata_key=metadata_key,
+            index_metadata=index_metadata,
+            vec_dist=vec_dist,
+        )
+        await store.aadd_texts(texts, metadatas=metadatas, ids=ids, batch_size=batch_size)
+        return store
 
     @classmethod
     def from_texts(

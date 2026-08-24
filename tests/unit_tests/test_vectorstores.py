@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -11,7 +12,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from typesense import AsyncClient, Client
-from typesense.exceptions import ObjectNotFound
+from typesense.exceptions import ObjectAlreadyExists, ObjectNotFound
 
 from langchain_typesense import (
     TypesenseCollectionError,
@@ -168,6 +169,75 @@ def test_add_documents_creates_schema_and_preserves_reserved_metadata_keys() -> 
     assert documents[0].id is None
 
 
+def test_custom_field_keys_are_used_for_schema_write_search_filter_and_read() -> None:
+    client = MagicMock()
+    collections = MagicMock()
+    collection = MagicMock()
+    client.collections = collections
+    collections.__getitem__.return_value = collection
+    store = TypesenseVectorStore(
+        client=cast(Client, client),
+        embedding=FakeEmbeddings(),
+        collection_name="custom-fields",
+        text_key="body",
+        vector_key="embedding",
+        metadata_key="attributes",
+    )
+    collection.retrieve.side_effect = ObjectNotFound("missing")
+    collection.documents.import_.return_value = [{"success": True}]
+
+    store.add_documents(
+        [Document(page_content="alpha", metadata={"source": "docs"})], ids=["doc-1"]
+    )
+
+    schema = collections.create.call_args.args[0]
+    assert [field["name"] for field in schema["fields"]] == [
+        "body",
+        "embedding",
+        "attributes",
+    ]
+    assert collection.documents.import_.call_args.args[0] == [
+        {
+            "id": "doc-1",
+            "body": "alpha",
+            "embedding": [5.0, 2.0, 1.0],
+            "attributes": {"source": "docs"},
+        }
+    ]
+
+    collection.documents.search.return_value = {
+        "hits": [
+            {
+                "document": {
+                    "id": "doc-1",
+                    "body": "alpha",
+                    "attributes": {"source": "docs"},
+                },
+                "vector_distance": 0.0,
+            }
+        ]
+    }
+    assert store.similarity_search("alpha", filter={"source": "docs"}) == [
+        Document(id="doc-1", page_content="alpha", metadata={"source": "docs"})
+    ]
+    parameters = collection.documents.search.call_args.args[0]
+    assert parameters["vector_query"].startswith("embedding:")
+    assert parameters["exclude_fields"] == "embedding"
+    assert parameters["filter_by"] == "attributes.source:=docs"
+
+    collection.documents.export.return_value = json.dumps(
+        {
+            "id": "doc-1",
+            "body": "alpha",
+            "embedding": [5.0, 2.0, 1.0],
+            "attributes": {"source": "docs"},
+        }
+    )
+    assert store.get_by_ids(["doc-1"]) == [
+        Document(id="doc-1", page_content="alpha", metadata={"source": "docs"})
+    ]
+
+
 def test_add_documents_validates_lengths_and_empty_input() -> None:
     store, _, collection = make_sync_store()
 
@@ -197,6 +267,44 @@ def test_add_documents_validates_existing_collection_schema() -> None:
         store.create_collection(3)
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda schema: schema["fields"].pop(0), "text"),
+        (lambda schema: schema["fields"][0].update(type="int32"), "string"),
+        (lambda schema: schema["fields"].pop(1), "vec"),
+        (lambda schema: schema["fields"][1].update(type="string[]"), "float"),
+        (lambda schema: schema["fields"][1].update(vec_dist="ip"), "cosine"),
+        (lambda schema: schema["fields"].pop(2), "metadata"),
+        (lambda schema: schema["fields"][2].update(type="string"), "object"),
+        (lambda schema: schema["fields"][2].update(index=False), "indexed"),
+        (lambda schema: schema.update(enable_nested_fields=False), "nested"),
+    ],
+)
+def test_collection_schema_rejects_every_incompatible_managed_setting(
+    mutate: Any, message: str
+) -> None:
+    store, _, collection = make_sync_store()
+    schema = collection_schema()
+    mutate(schema)
+    collection.retrieve.return_value = schema
+
+    with pytest.raises(TypesenseCollectionError, match=message):
+        store.create_collection(3)
+
+
+def test_collection_creation_handles_another_creator_winning_the_race() -> None:
+    store, collections, collection = make_sync_store()
+    collection.retrieve.side_effect = [ObjectNotFound("missing"), collection_schema()]
+    collections.create.side_effect = ObjectAlreadyExists("created concurrently")
+
+    store.create_collection(3)
+    store.create_collection(3)
+
+    assert collection.retrieve.call_count == 2
+    collections.create.assert_called_once()
+
+
 def test_bulk_import_failures_are_not_silently_ignored() -> None:
     store, _, collection = make_sync_store()
     collection.retrieve.return_value = collection_schema()
@@ -223,7 +331,7 @@ def test_schema_validation_is_cached_and_recovers_after_collection_removal() -> 
     store.add_documents([Document(page_content="alpha")], ids=["second"])
 
     assert collections.create.call_count == 2
-    assert collection.retrieve.call_count == 2
+    assert collection.retrieve.call_count == 1
     assert collection.documents.import_.call_count == 3
 
 
@@ -374,33 +482,62 @@ def test_mmr_search_requests_vectors_and_returns_documents() -> None:
     assert parameters["per_page"] == 2
 
 
+def test_mmr_fetches_exactly_fetch_k_candidates() -> None:
+    store, _, collection = make_sync_store()
+    collection.documents.search.return_value = search_response(include_vectors=True)
+
+    results = store.max_marginal_relevance_search("bar", k=3, fetch_k=2)
+
+    assert len(results) == 2
+    assert collection.documents.search.call_args.args[0]["per_page"] == 2
+
+
 def test_get_by_ids_deduplicates_and_ignores_missing_ids() -> None:
     store, _, collection = make_sync_store()
-    first = MagicMock()
-    missing = MagicMock()
-    first.retrieve.return_value = {
-        "id": "doc-1",
-        "text": "bar",
-        "vec": [1.0, 0.0, 0.0],
-        "metadata": {"source": "tweet"},
-    }
-    missing.retrieve.side_effect = ObjectNotFound("missing")
-    collection.documents.__getitem__.side_effect = lambda document_id: {
-        "doc-1": first,
-        "missing": missing,
-    }[document_id]
+    collection.documents.export.return_value = "\n".join(
+        [
+            json.dumps(
+                {
+                    "id": "doc-2",
+                    "text": "foo",
+                    "vec": [1.0, 0.0, 0.0],
+                    "metadata": {"source": "news"},
+                }
+            ),
+            json.dumps(
+                {
+                    "id": "doc-1",
+                    "text": "bar",
+                    "vec": [1.0, 0.0, 0.0],
+                    "metadata": {"source": "tweet"},
+                }
+            ),
+        ]
+    )
 
-    results = store.get_by_ids(["doc-1", "missing", "doc-1"])
+    results = store.get_by_ids(["doc-1", "missing", "doc-2", "doc-1"])
 
-    assert results == [Document(id="doc-1", page_content="bar", metadata={"source": "tweet"})]
-    first.retrieve.assert_called_once()
+    assert results == [
+        Document(id="doc-1", page_content="bar", metadata={"source": "tweet"}),
+        Document(id="doc-2", page_content="foo", metadata={"source": "news"}),
+    ]
+    collection.documents.export.assert_called_once_with({"filter_by": "id:=[doc-1,missing,doc-2]"})
 
 
 def test_get_by_ids_raises_when_collection_is_missing() -> None:
     store, _, collection = make_sync_store()
-    collection.retrieve.side_effect = ObjectNotFound("missing collection")
+    collection.documents.export.side_effect = ObjectNotFound("missing collection")
 
     with pytest.raises(ObjectNotFound):
+        store.get_by_ids(["doc-1"])
+
+
+@pytest.mark.parametrize("response", [None, "not-json", "[]"])
+def test_get_by_ids_rejects_malformed_export_responses(response: object) -> None:
+    store, _, collection = make_sync_store()
+    collection.documents.export.return_value = response
+
+    with pytest.raises(TypesenseVectorStoreError, match="export|JSON|non-object"):
         store.get_by_ids(["doc-1"])
 
 
@@ -409,9 +546,9 @@ def test_delete_uses_safe_bulk_filter_and_requires_explicit_truncate() -> None:
 
     assert store.delete(["doc-1", "doc-2"]) is True
     collection.documents.delete.assert_called_with({"filter_by": "id:=[doc-1,doc-2]"})
-    with pytest.raises(ValueError, match="allow_delete_all"):
+    with pytest.raises(ValueError, match="delete_all_documents"):
         store.delete()
-    assert store.delete(allow_delete_all=True) is True
+    assert store.delete(delete_all_documents=True) is True
     collection.documents.delete.assert_called_with({"truncate": True})
 
 
@@ -482,6 +619,18 @@ def test_from_client_params_defaults_to_sync_and_can_create_both_clients() -> No
     assert async_client.call_count == 1
     assert both_store.client is sync_client.return_value
     assert both_store.async_client is async_client.return_value
+
+
+def test_from_client_params_preserves_an_explicit_standard_port() -> None:
+    with patch("langchain_typesense.vectorstores.Client") as sync_client:
+        TypesenseVectorStore.from_client_params(
+            FakeEmbeddings(),
+            typesense_url="https://example.typesense.net:443",
+            api_key="key",
+        )
+
+    config = sync_client.call_args.args[0]
+    assert config["nodes"] == [{"host": "example.typesense.net", "port": 443, "protocol": "https"}]
 
 
 @pytest.mark.asyncio
@@ -560,20 +709,43 @@ async def test_afrom_documents_generates_only_missing_mixed_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_afrom_documents_supports_an_async_only_client() -> None:
+    async_client = MagicMock()
+    collections = MagicMock()
+    collection = MagicMock()
+    async_client.collections = collections
+    collections.__getitem__.return_value = collection
+    collection.retrieve = AsyncMock(side_effect=ObjectNotFound("missing"))
+    collections.create = AsyncMock(return_value=collection_schema())
+    collection.documents.import_ = AsyncMock(return_value=[{"success": True}])
+
+    store = await TypesenseVectorStore.afrom_documents(
+        [Document(id="provided", page_content="one")],
+        FakeEmbeddings(),
+        client=None,
+        async_client=cast(AsyncClient, async_client),
+    )
+
+    assert store.client is None
+    assert store.async_client is async_client
+    collection.documents.import_.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_async_methods_fall_back_to_sync_client() -> None:
     store, collections, collection = make_sync_store()
     collection.documents.search.return_value = search_response()
     collection.retrieve.return_value = collection_schema()
     collection.documents.delete.return_value = {"num_deleted": 1}
     collection.documents.import_.return_value = [{"success": True}]
-    first = MagicMock()
-    first.retrieve.return_value = {
-        "id": "doc-1",
-        "text": "bar",
-        "vec": [3.0, 1.0, 1.0],
-        "metadata": {},
-    }
-    collection.documents.__getitem__.return_value = first
+    collection.documents.export.return_value = json.dumps(
+        {
+            "id": "doc-1",
+            "text": "bar",
+            "vec": [3.0, 1.0, 1.0],
+            "metadata": {},
+        }
+    )
 
     assert [doc.id for doc in await store.asimilarity_search("bar", k=1)] == [
         "doc-1",
