@@ -1,10 +1,15 @@
-# langchain-typesense
+# 🦜🔎⚡️ langchain-typesense
 
-`langchain-typesense` is a LangChain `VectorStore` backed by Typesense. It supports sync
-and async writes, vector search, relevance scores, MMR, metadata filters, ID lookup, and
-deletion.
+**`langchain-typesense`** is a LangChain `VectorStore` implementation for Typesense.
 
-## Install
+**Features:**
+
+- **Sync & Async:** Supports both synchronous and asynchronous methods.
+- **Search & Retrieval**: Vector similarity search, hybrid search, MMR (Maximal Marginal Relevance), and relevance scoring.
+- **Filtering:** Metadata filtering via Typesense filter expressions.
+- **Document Management:** Batch writes, ID lookups, and deletions.
+
+## Installation
 
 Requirements:
 
