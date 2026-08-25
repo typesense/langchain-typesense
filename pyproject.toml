@@ -11,7 +11,7 @@ authors = [
 maintainers = [
     { name = "Typesense" },
 ]
-keywords = ["langchain", "typesense", "vector-store", "semantic-search", "rag"]
+keywords = ["langchain", "typesense", "vector-store", "semantic-search", "hybrid-search", "langchain-integration", "rag"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

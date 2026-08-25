@@ -93,6 +93,43 @@ class TypesenseSearchParameters(TypedDict, total=False):
     diversity_lambda: float
 
 
+class TypesenseHybridSearchParameters(TypesenseSearchParameters, total=False):
+    """Safe Typesense options for the keyword side of hybrid search.
+
+    These options tune keyword matching or request execution without replacing the
+    adapter-managed query, vector query, result count, filtering, or returned fields.
+    ``rerank_hybrid_matches`` asks Typesense to calculate both keyword and vector
+    scores for every candidate before rank fusion; it can improve ranking at an
+    additional compute cost.
+    """
+
+    prefix: str | bool | list[bool]
+    infix: Literal["off", "always", "fallback"] | list[Literal["off", "always", "fallback"]]
+    pre_segmented_query: bool
+    stopwords: str | list[str]
+    validate_field_names: bool
+    query_by_weights: str | list[int]
+    text_match_type: Literal["max_score", "max_weight"]
+    prioritize_exact_match: bool
+    prioritize_token_position: bool
+    prioritize_num_matching_fields: bool
+    max_candidates: int
+    enable_synonyms: bool
+    filter_curated_hits: bool
+    synonym_prefix: bool
+    num_typos: int
+    min_len_1typo: int
+    min_len_2typo: int
+    split_join_tokens: Literal["off", "fallback", "always"]
+    typo_tokens_threshold: int
+    drop_tokens_threshold: int
+    drop_tokens_mode: Literal["right_to_left", "left_to_right", "both_sides:3"]
+    enable_typos_for_numerical_tokens: bool
+    enable_typos_for_alpha_numerical_tokens: bool
+    synonym_num_typos: int
+    rerank_hybrid_matches: bool
+
+
 _FILTER_FIELD_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 _MANAGED_SEARCH_PARAMETERS = frozenset(
     {
@@ -103,9 +140,16 @@ _MANAGED_SEARCH_PARAMETERS = frozenset(
         "filter_by",
         "include_fields",
         "exclude_fields",
+        "query_by",
     }
 )
 _SAFE_SEARCH_PARAMETERS = frozenset(TypesenseSearchParameters.__annotations__)
+_SAFE_HYBRID_SEARCH_PARAMETERS = frozenset(
+    {
+        *TypesenseSearchParameters.__annotations__,
+        *TypesenseHybridSearchParameters.__annotations__,
+    }
+)
 
 
 class TypesenseVectorStoreError(RuntimeError):
@@ -488,21 +532,17 @@ class TypesenseVectorStore(VectorStore):
     ) -> SearchParameters:
         """Build a vector search request while protecting managed parameters."""
         self._validate_k(k)
-        self._validate_vector_query_options(distance_threshold, ef, flat_search_cutoff)
-        validated = self._validate_vectors([embedding], 1)[0]
+        vector_query = self._build_vector_query(
+            embedding,
+            k,
+            distance_threshold=distance_threshold,
+            ef=ef,
+            flat_search_cutoff=flat_search_cutoff,
+        )
 
-        vector_options = [f"k:{k}"]
-        if distance_threshold is not None:
-            vector_options.append(f"distance_threshold:{distance_threshold!r}")
-        if ef is not None:
-            vector_options.append(f"ef:{ef}")
-        if flat_search_cutoff is not None:
-            vector_options.append(f"flat_search_cutoff:{flat_search_cutoff}")
-
-        vector = ",".join(repr(value) for value in validated)
         parameters: dict[str, Any] = {
             "q": "*",
-            "vector_query": (f"{self._vector_key}:([{vector}], {', '.join(vector_options)})"),
+            "vector_query": vector_query,
             "per_page": k,
         }
         if not include_vectors:
@@ -525,6 +565,123 @@ class TypesenseVectorStore(VectorStore):
                     f"{names}. This integration only forwards options that preserve "
                     "the vector-search response contract."
                 )
+            parameters.update(search_parameters)
+
+        if filter is not None:
+            filter_by = self._to_filter_by(filter)
+            if filter_by:
+                parameters["filter_by"] = filter_by
+        return cast(SearchParameters, parameters)
+
+    def _build_vector_query(
+        self,
+        embedding: Sequence[float],
+        k: int,
+        *,
+        distance_threshold: float | None,
+        ef: int | None,
+        flat_search_cutoff: int | None,
+        alpha: float | None = None,
+    ) -> str:
+        """Serialize an embedding and its Typesense vector-query options."""
+        self._validate_vector_query_options(distance_threshold, ef, flat_search_cutoff)
+        validated = self._validate_vectors([embedding], 1)[0]
+
+        vector_options = [f"k:{k}"]
+        if distance_threshold is not None:
+            vector_options.append(f"distance_threshold:{distance_threshold!r}")
+        if ef is not None:
+            vector_options.append(f"ef:{ef}")
+        if flat_search_cutoff is not None:
+            vector_options.append(f"flat_search_cutoff:{flat_search_cutoff}")
+        if alpha is not None:
+            vector_options.append(f"alpha:{alpha!r}")
+
+        vector = ",".join(repr(value) for value in validated)
+        return f"{self._vector_key}:([{vector}], {', '.join(vector_options)})"
+
+    def _normalize_hybrid_query_by(self, query_by: str | Sequence[str] | None) -> str:
+        """Return a comma-separated keyword-field list for hybrid search."""
+        if query_by is None:
+            fields = [self._text_key]
+        elif isinstance(query_by, str):
+            fields = [field.strip() for field in query_by.split(",")]
+        else:
+            fields = [field.strip() for field in query_by]
+        if not fields or any(not field for field in fields):
+            raise ValueError("`query_by` must contain at least one non-empty field name.")
+        if self._vector_key in fields:
+            raise ValueError(
+                f"`query_by` must not contain vector field `{self._vector_key}` when "
+                "the adapter supplies a manual `vector_query`."
+            )
+        return ",".join(fields)
+
+    @staticmethod
+    def _validate_hybrid_query(query: str, alpha: float) -> None:
+        """Validate the keyword query and vector weight used for rank fusion."""
+        if not query.strip():
+            raise ValueError("Hybrid search `query` must not be empty.")
+        if isinstance(alpha, bool) or not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError("`alpha` must be a finite number between 0 and 1.")
+
+    def _validate_hybrid_search_options(
+        self,
+        query: str,
+        k: int,
+        alpha: float,
+        query_by: str | Sequence[str] | None,
+        search_parameters: TypesenseHybridSearchParameters | None,
+    ) -> str:
+        """Validate hybrid options before doing embedding or network work."""
+        self._validate_k(k)
+        self._validate_hybrid_query(query, alpha)
+        normalized_query_by = self._normalize_hybrid_query_by(query_by)
+        if search_parameters:
+            conflicts = _MANAGED_SEARCH_PARAMETERS.intersection(search_parameters)
+            if conflicts:
+                names = ", ".join(sorted(conflicts))
+                raise ValueError(
+                    "`search_parameters` must not override hybrid-search-managed "
+                    f"parameters: {names}."
+                )
+            unsupported = set(search_parameters).difference(_SAFE_HYBRID_SEARCH_PARAMETERS)
+            if unsupported:
+                names = ", ".join(sorted(unsupported))
+                raise ValueError(f"Unsupported Typesense hybrid `search_parameters`: {names}.")
+        return normalized_query_by
+
+    def _build_hybrid_search_parameters(
+        self,
+        query: str,
+        embedding: Sequence[float],
+        k: int,
+        *,
+        alpha: float,
+        query_by: str,
+        filter: Filter | None,
+        search_parameters: TypesenseHybridSearchParameters | None,
+        distance_threshold: float | None,
+        ef: int | None,
+        flat_search_cutoff: int | None,
+    ) -> SearchParameters:
+        """Build a Typesense request that fuses keyword and vector ranking."""
+        parameters: dict[str, Any] = {
+            "q": query,
+            "query_by": query_by,
+            "vector_query": self._build_vector_query(
+                embedding,
+                k,
+                distance_threshold=distance_threshold,
+                ef=ef,
+                flat_search_cutoff=flat_search_cutoff,
+                alpha=alpha,
+            ),
+            "per_page": k,
+            "exclude_fields": self._vector_key,
+        }
+
+        if search_parameters:
             parameters.update(search_parameters)
 
         if filter is not None:
@@ -610,6 +767,51 @@ class TypesenseVectorStore(VectorStore):
                     ),
                     distance,
                     vector,
+                )
+            )
+        return results
+
+    def _parse_hybrid_search_response(
+        self,
+        response: Mapping[str, Any],
+    ) -> list[tuple[Document, float]]:
+        """Convert Typesense hybrid hits to documents and rank-fusion scores."""
+        if not isinstance(response, Mapping):
+            raise TypesenseVectorStoreError("Typesense hybrid search response must be an object.")
+        hits = response.get("hits")
+        if not isinstance(hits, list):
+            raise TypesenseVectorStoreError(
+                "Typesense hybrid search response is missing valid `hits`."
+            )
+
+        results: list[tuple[Document, float]] = []
+        for raw_hit in hits:
+            if not isinstance(raw_hit, Mapping) or not isinstance(raw_hit.get("document"), Mapping):
+                raise TypesenseVectorStoreError("Typesense returned a malformed hybrid search hit.")
+            raw_info = raw_hit.get("hybrid_search_info")
+            if not isinstance(raw_info, Mapping):
+                raise TypesenseVectorStoreError(
+                    "Typesense hybrid search hit is missing `hybrid_search_info`."
+                )
+            raw_score = raw_info.get("rank_fusion_score")
+            if raw_score is None or isinstance(raw_score, bool):
+                raise TypesenseVectorStoreError(
+                    "Typesense hybrid search hit has an invalid rank-fusion score."
+                )
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError) as error:
+                raise TypesenseVectorStoreError(
+                    "Typesense hybrid search hit has an invalid rank-fusion score."
+                ) from error
+            if not math.isfinite(score):
+                raise TypesenseVectorStoreError(
+                    "Typesense hybrid search hit has an invalid rank-fusion score."
+                )
+            results.append(
+                (
+                    self._document_from_typesense(cast(Mapping[str, Any], raw_hit["document"])),
+                    score,
                 )
             )
         return results
@@ -1338,6 +1540,181 @@ class TypesenseVectorStore(VectorStore):
         ]
 
     # ------------------------------------------------------------------
+    # Hybrid keyword and vector search
+    # ------------------------------------------------------------------
+    def hybrid_search(
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        alpha: float = 0.3,
+        query_by: str | Sequence[str] | None = None,
+        filter: Filter | None = None,
+        search_parameters: TypesenseHybridSearchParameters | None = None,
+        distance_threshold: float | None = None,
+        ef: int | None = None,
+        flat_search_cutoff: int | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Return documents ranked by Typesense keyword/vector rank fusion.
+
+        ``alpha`` is the vector-ranking weight: ``0`` favors keyword ranking and
+        ``1`` favors vector ranking. Keyword search targets the configured text
+        field unless ``query_by`` supplies other indexed string fields.
+        """
+        if kwargs:
+            raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
+        return [
+            document
+            for document, _ in self.hybrid_search_with_score(
+                query,
+                k=k,
+                alpha=alpha,
+                query_by=query_by,
+                filter=filter,
+                search_parameters=search_parameters,
+                distance_threshold=distance_threshold,
+                ef=ef,
+                flat_search_cutoff=flat_search_cutoff,
+            )
+        ]
+
+    def hybrid_search_with_score(
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        alpha: float = 0.3,
+        query_by: str | Sequence[str] | None = None,
+        filter: Filter | None = None,
+        search_parameters: TypesenseHybridSearchParameters | None = None,
+        distance_threshold: float | None = None,
+        ef: int | None = None,
+        flat_search_cutoff: int | None = None,
+        **kwargs: Any,
+    ) -> list[tuple[Document, float]]:
+        """Return documents with Typesense rank-fusion scores.
+
+        Higher fusion scores rank first. They are rank-dependent hybrid scores,
+        not raw vector distances or normalized LangChain relevance scores, and
+        should not be compared across separate searches.
+        """
+        if kwargs:
+            raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
+        self._validate_k(k)
+        if k == 0:
+            return []
+        normalized_query_by = self._validate_hybrid_search_options(
+            query, k, alpha, query_by, search_parameters
+        )
+        embedding = self._embedding.embed_query(query)
+        parameters = self._build_hybrid_search_parameters(
+            query,
+            embedding,
+            k,
+            alpha=alpha,
+            query_by=normalized_query_by,
+            filter=filter,
+            search_parameters=search_parameters,
+            distance_threshold=distance_threshold,
+            ef=ef,
+            flat_search_cutoff=flat_search_cutoff,
+        )
+        response = (
+            self._require_sync_client()
+            .collections[self._collection_name]
+            .documents.search(parameters)
+        )
+        return self._parse_hybrid_search_response(response)
+
+    async def ahybrid_search(
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        alpha: float = 0.3,
+        query_by: str | Sequence[str] | None = None,
+        filter: Filter | None = None,
+        search_parameters: TypesenseHybridSearchParameters | None = None,
+        distance_threshold: float | None = None,
+        ef: int | None = None,
+        flat_search_cutoff: int | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Asynchronously return documents ranked by keyword/vector fusion."""
+        if kwargs:
+            raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
+        return [
+            document
+            for document, _ in await self.ahybrid_search_with_score(
+                query,
+                k=k,
+                alpha=alpha,
+                query_by=query_by,
+                filter=filter,
+                search_parameters=search_parameters,
+                distance_threshold=distance_threshold,
+                ef=ef,
+                flat_search_cutoff=flat_search_cutoff,
+            )
+        ]
+
+    async def ahybrid_search_with_score(
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        alpha: float = 0.3,
+        query_by: str | Sequence[str] | None = None,
+        filter: Filter | None = None,
+        search_parameters: TypesenseHybridSearchParameters | None = None,
+        distance_threshold: float | None = None,
+        ef: int | None = None,
+        flat_search_cutoff: int | None = None,
+        **kwargs: Any,
+    ) -> list[tuple[Document, float]]:
+        """Asynchronously return documents with rank-fusion scores."""
+        if kwargs:
+            raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
+        if self._async_client is None:
+            return await run_in_executor(
+                None,
+                self.hybrid_search_with_score,
+                query,
+                k=k,
+                alpha=alpha,
+                query_by=query_by,
+                filter=filter,
+                search_parameters=search_parameters,
+                distance_threshold=distance_threshold,
+                ef=ef,
+                flat_search_cutoff=flat_search_cutoff,
+            )
+        self._validate_k(k)
+        if k == 0:
+            return []
+        normalized_query_by = self._validate_hybrid_search_options(
+            query, k, alpha, query_by, search_parameters
+        )
+        embedding = await self._embedding.aembed_query(query)
+        parameters = self._build_hybrid_search_parameters(
+            query,
+            embedding,
+            k,
+            alpha=alpha,
+            query_by=normalized_query_by,
+            filter=filter,
+            search_parameters=search_parameters,
+            distance_threshold=distance_threshold,
+            ef=ef,
+            flat_search_cutoff=flat_search_cutoff,
+        )
+        response = await self._async_client.collections[self._collection_name].documents.search(
+            parameters
+        )
+        return self._parse_hybrid_search_response(response)
+
+    # ------------------------------------------------------------------
     # Maximal marginal relevance
     # ------------------------------------------------------------------
     @staticmethod
@@ -2026,6 +2403,7 @@ __all__ = [
     "ClientMode",
     "Typesense",
     "TypesenseCollectionError",
+    "TypesenseHybridSearchParameters",
     "TypesenseImportError",
     "TypesenseSearchParameters",
     "TypesenseVectorStore",

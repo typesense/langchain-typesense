@@ -44,6 +44,22 @@ class HardcodedEmbeddings(Embeddings):
         return list(self._vectors[text])
 
 
+class HybridEmbeddings(Embeddings):
+    """Vectors that put an exact keyword hit and semantic hit in opposition."""
+
+    _vectors = {
+        "wireless keyboard": [1.0, 0.0, 0.0],
+        "wireless keyboard exact": [0.0, 1.0, 0.0],
+        "unrelated words": [1.0, 0.0, 0.0],
+    }
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed_query(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return list(self._vectors[text])
+
+
 def client_config() -> ConfigDict:
     """Return the local integration-test Typesense configuration."""
     return {
@@ -239,6 +255,13 @@ class TestHardcodedTypesenseMethods:
                     metadata={"source": "docs"},
                 )
             ]
+            assert await store.ahybrid_search("alpha", k=1, filter={"source": "docs"}) == [
+                Document(
+                    id="alpha",
+                    page_content="alpha",
+                    metadata={"source": "docs"},
+                )
+            ]
             assert await store.aget_by_ids(["missing", "alpha", "alpha"]) == [
                 Document(
                     id="alpha",
@@ -246,6 +269,51 @@ class TestHardcodedTypesenseMethods:
                     metadata={"source": "docs"},
                 )
             ]
+        finally:
+            await store.adelete_collection()
+            await store.aclose()
+
+    async def test_hybrid_search_changes_ranking_with_alpha(self) -> None:
+        config = client_config()
+        collection_name = f"langchain-typesense-hybrid-{uuid4()}"
+        store = TypesenseVectorStore(
+            client=typesense.Client(config),
+            async_client=typesense.AsyncClient(config),
+            embedding=HybridEmbeddings(),
+            collection_name=collection_name,
+        )
+        try:
+            store.add_documents(
+                [
+                    Document(
+                        page_content="wireless keyboard exact",
+                        metadata={"kind": "keyword"},
+                    ),
+                    Document(
+                        page_content="unrelated words",
+                        metadata={"kind": "semantic"},
+                    ),
+                ],
+                ids=["keyword", "semantic"],
+            )
+
+            keyword_weighted = store.hybrid_search_with_score(
+                "wireless keyboard",
+                k=2,
+                alpha=0.0,
+                search_parameters={"drop_tokens_threshold": 0},
+            )
+            vector_weighted = await store.ahybrid_search_with_score(
+                "wireless keyboard",
+                k=2,
+                alpha=1.0,
+                search_parameters={"drop_tokens_threshold": 0},
+            )
+
+            assert keyword_weighted[0][0].id == "keyword"
+            assert vector_weighted[0][0].id == "semantic"
+            assert all(score >= 0.0 for _, score in keyword_weighted)
+            assert all(score >= 0.0 for _, score in vector_weighted)
         finally:
             await store.adelete_collection()
             await store.aclose()

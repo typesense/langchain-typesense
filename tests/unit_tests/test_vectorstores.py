@@ -16,6 +16,7 @@ from typesense.exceptions import ObjectAlreadyExists, ObjectNotFound
 
 from langchain_typesense import (
     TypesenseCollectionError,
+    TypesenseHybridSearchParameters,
     TypesenseImportError,
     TypesenseVectorStore,
     TypesenseVectorStoreError,
@@ -78,12 +79,12 @@ def collection_schema(num_dim: int = 3, vec_dist: str = "cosine") -> dict[str, A
 
 
 def search_response(*, include_vectors: bool = False) -> dict[str, Any]:
-    first = {
+    first: dict[str, Any] = {
         "id": "doc-1",
         "text": "bar",
         "metadata": {"source": "tweet", "id": 7},
     }
-    second = {
+    second: dict[str, Any] = {
         "id": "doc-2",
         "text": "foo",
         "metadata": {"source": "news"},
@@ -99,12 +100,40 @@ def search_response(*, include_vectors: bool = False) -> dict[str, Any]:
     }
 
 
+def hybrid_search_response() -> dict[str, Any]:
+    return {
+        "hits": [
+            {
+                "document": {
+                    "id": "doc-1",
+                    "text": "bar",
+                    "metadata": {"source": "tweet"},
+                },
+                "hybrid_search_info": {"rank_fusion_score": 0.75},
+                "text_match": 100,
+                "vector_distance": 0.1,
+            },
+            {
+                "document": {
+                    "id": "doc-2",
+                    "text": "foo",
+                    "metadata": {"source": "news"},
+                },
+                "hybrid_search_info": {"rank_fusion_score": 0.3},
+                "text_match": 0,
+                "vector_distance": 0.0,
+            },
+        ]
+    }
+
+
 def test_typesense_vectorstore_is_a_vectorstore() -> None:
     store, _, _ = make_sync_store()
 
     assert isinstance(store, VectorStore)
     assert store.collection_name == "test-collection"
     assert store.embeddings is not None
+    assert TypesenseHybridSearchParameters.__name__ == "TypesenseHybridSearchParameters"
 
 
 def test_constructor_rejects_reserved_or_duplicate_fields() -> None:
@@ -399,7 +428,7 @@ def test_similarity_search_rejects_parameters_that_break_vector_contract(
     store, _, _ = make_sync_store()
 
     with pytest.raises(ValueError, match="search_parameters|integration-managed"):
-        store.similarity_search("query", search_parameters={parameter: "value"})
+        store.similarity_search("query", search_parameters=cast(Any, {parameter: "value"}))
 
 
 def test_v30_curation_search_parameters_are_forwarded() -> None:
@@ -442,6 +471,195 @@ def test_relevance_scores_normalize_typesense_cosine_distance() -> None:
 
     assert results[0][1] == pytest.approx(0.95)
     assert results[1][1] == pytest.approx(0.8)
+
+
+def test_hybrid_search_builds_fused_request_and_returns_rank_fusion_scores() -> None:
+    store, _, collection = make_sync_store()
+    collection.documents.search.return_value = hybrid_search_response()
+
+    results = store.hybrid_search_with_score(
+        "bar",
+        k=2,
+        alpha=0.65,
+        query_by=["text", "metadata.title"],
+        filter={"source": "tweet"},
+        distance_threshold=0.5,
+        ef=40,
+        flat_search_cutoff=10,
+        search_parameters={
+            "drop_tokens_threshold": 0,
+            "num_typos": 1,
+            "rerank_hybrid_matches": True,
+            "enable_lazy_filter": True,
+        },
+    )
+
+    assert results == [
+        (
+            Document(id="doc-1", page_content="bar", metadata={"source": "tweet"}),
+            0.75,
+        ),
+        (
+            Document(id="doc-2", page_content="foo", metadata={"source": "news"}),
+            0.3,
+        ),
+    ]
+    parameters = collection.documents.search.call_args.args[0]
+    assert parameters["q"] == "bar"
+    assert parameters["query_by"] == "text,metadata.title"
+    assert parameters["per_page"] == 2
+    assert parameters["exclude_fields"] == "vec"
+    assert parameters["filter_by"] == "metadata.source:=tweet"
+    assert parameters["drop_tokens_threshold"] == 0
+    assert parameters["num_typos"] == 1
+    assert parameters["rerank_hybrid_matches"] is True
+    assert "k:2" in parameters["vector_query"]
+    assert "alpha:0.65" in parameters["vector_query"]
+    assert "distance_threshold:0.5" in parameters["vector_query"]
+    assert "ef:40" in parameters["vector_query"]
+    assert "flat_search_cutoff:10" in parameters["vector_query"]
+
+
+def test_all_hybrid_keyword_parameters_are_forwarded() -> None:
+    store, _, collection = make_sync_store()
+    collection.documents.search.return_value = hybrid_search_response()
+    options: TypesenseHybridSearchParameters = {
+        "prefix": [True, False],
+        "infix": ["off", "fallback"],
+        "pre_segmented_query": True,
+        "stopwords": ["a", "the"],
+        "validate_field_names": True,
+        "query_by_weights": [2, 1],
+        "text_match_type": "max_weight",
+        "prioritize_exact_match": True,
+        "prioritize_token_position": True,
+        "prioritize_num_matching_fields": True,
+        "max_candidates": 100,
+        "enable_synonyms": False,
+        "filter_curated_hits": True,
+        "synonym_prefix": True,
+        "num_typos": 1,
+        "min_len_1typo": 4,
+        "min_len_2typo": 7,
+        "split_join_tokens": "fallback",
+        "typo_tokens_threshold": 2,
+        "drop_tokens_threshold": 0,
+        "drop_tokens_mode": "left_to_right",
+        "enable_typos_for_numerical_tokens": False,
+        "enable_typos_for_alpha_numerical_tokens": False,
+        "synonym_num_typos": 1,
+        "rerank_hybrid_matches": True,
+    }
+
+    store.hybrid_search("query", query_by=["text", "metadata.title"], search_parameters=options)
+
+    request = collection.documents.search.call_args.args[0]
+    for name, value in options.items():
+        assert request[name] == value
+
+
+def test_hybrid_search_returns_documents_and_uses_custom_managed_fields() -> None:
+    client = MagicMock()
+    collection = MagicMock()
+    client.collections.__getitem__.return_value = collection
+    store = TypesenseVectorStore(
+        client=cast(Client, client),
+        embedding=FakeEmbeddings(),
+        text_key="body",
+        vector_key="embedding",
+        metadata_key="attributes",
+    )
+    collection.documents.search.return_value = {
+        "hits": [
+            {
+                "document": {
+                    "id": "doc-1",
+                    "body": "bar",
+                    "attributes": {"source": "docs"},
+                },
+                "hybrid_search_info": {"rank_fusion_score": 0.5},
+            }
+        ]
+    }
+
+    assert store.hybrid_search("bar") == [
+        Document(id="doc-1", page_content="bar", metadata={"source": "docs"})
+    ]
+    parameters = collection.documents.search.call_args.args[0]
+    assert parameters["query_by"] == "body"
+    assert parameters["exclude_fields"] == "embedding"
+    assert parameters["vector_query"].startswith("embedding:")
+    assert "alpha:0.3" in parameters["vector_query"]
+
+
+@pytest.mark.parametrize("alpha", [-0.1, 1.1, float("nan"), float("inf"), True])
+def test_hybrid_search_validates_alpha_before_embedding(alpha: Any) -> None:
+    store, _, _ = make_sync_store()
+
+    with patch.object(store.embeddings, "embed_query") as embed_query:
+        with pytest.raises(ValueError, match="alpha"):
+            store.hybrid_search("query", alpha=alpha)
+        embed_query.assert_not_called()
+
+
+def test_hybrid_search_validates_query_count_and_keyword_fields() -> None:
+    store, _, _ = make_sync_store()
+
+    with patch.object(store.embeddings, "embed_query") as embed_query:
+        with pytest.raises(ValueError, match="must not be empty"):
+            store.hybrid_search("  ")
+        embed_query.assert_not_called()
+    with pytest.raises(ValueError, match="greater than or equal"):
+        store.hybrid_search("query", k=-1)
+    assert store.hybrid_search("query", k=0) == []
+    with pytest.raises(ValueError, match="query_by"):
+        store.hybrid_search("query", query_by=[])
+    with pytest.raises(ValueError, match="vector field"):
+        store.hybrid_search("query", query_by=["text", "vec"])
+
+
+@pytest.mark.parametrize("parameter", ["q", "query_by", "vector_query", "sort_by", "preset"])
+def test_hybrid_search_rejects_managed_or_contract_breaking_parameters(parameter: str) -> None:
+    store, _, _ = make_sync_store()
+
+    with pytest.raises(ValueError, match="managed|Unsupported"):
+        store.hybrid_search(
+            "query",
+            search_parameters=cast(Any, {parameter: "value"}),
+        )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"hits": {}},
+        {"hits": [None]},
+        {"hits": [{"document": {"id": "x", "text": "x"}}]},
+        {
+            "hits": [
+                {
+                    "document": {"id": "x", "text": "x"},
+                    "hybrid_search_info": {"rank_fusion_score": float("nan")},
+                }
+            ]
+        },
+        {
+            "hits": [
+                {
+                    "document": {"id": "x", "text": "x"},
+                    "hybrid_search_info": {"rank_fusion_score": True},
+                }
+            ]
+        },
+    ],
+)
+def test_hybrid_search_rejects_malformed_responses(response: dict[str, Any]) -> None:
+    store, _, collection = make_sync_store()
+    collection.documents.search.return_value = response
+
+    with pytest.raises(TypesenseVectorStoreError, match="hybrid"):
+        store.hybrid_search_with_score("query")
 
 
 def test_inherited_search_and_retriever_use_similarity_contract() -> None:
@@ -752,11 +970,16 @@ async def test_async_methods_fall_back_to_sync_client() -> None:
         "doc-2",
     ]
     assert await store.asimilarity_search_by_vector([3.0, 1.0, 1.0], k=1)
+    collection.documents.search.return_value = hybrid_search_response()
+    assert [doc.id for doc in await store.ahybrid_search("bar", k=2)] == [
+        "doc-1",
+        "doc-2",
+    ]
     assert await store.aadd_documents([Document(page_content="bar")], ids=["doc-2"])
     assert await store.aget_by_ids(["doc-1"])
     assert await store.adelete(["doc-1"])
     assert await store.adelete_collection() is True
-    assert await store.acreate_collection(3) is None
+    await store.acreate_collection(3)
     assert collections.__getitem__.called
 
 
@@ -781,8 +1004,22 @@ async def test_native_async_add_and_search() -> None:
 
     ids = await store.aadd_documents([Document(page_content="bar")], ids=["doc-1"])
     results = await store.asimilarity_search("bar", k=2)
+    collection.documents.search.return_value = hybrid_search_response()
+    hybrid = await store.ahybrid_search_with_score(
+        "bar",
+        k=2,
+        alpha=0.8,
+        search_parameters={"drop_tokens_threshold": 0},
+    )
 
     assert ids == ["doc-1"]
     assert [document.id for document in results] == ["doc-1", "doc-2"]
+    assert [(document.id, score) for document, score in hybrid] == [
+        ("doc-1", 0.75),
+        ("doc-2", 0.3),
+    ]
     collection.documents.import_.assert_awaited_once()
-    collection.documents.search.assert_awaited_once()
+    assert collection.documents.search.await_count == 2
+    hybrid_parameters = collection.documents.search.await_args_list[1].args[0]
+    assert hybrid_parameters["q"] == "bar"
+    assert "alpha:0.8" in hybrid_parameters["vector_query"]
