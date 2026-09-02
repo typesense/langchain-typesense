@@ -1,17 +1,7 @@
-"""Typesense-backed vector storage for LangChain.
+"""Typesense vector storage for LangChain.
 
-The integration stores each :class:`~langchain_core.documents.Document` as a
-Typesense document with three configurable fields: text, vector, and nested
-metadata. Collections are created lazily from the first batch of embeddings and
-are validated on writes. Search uses the configured Typesense vector distance;
-the ``*_with_score`` methods return raw distance where lower is better. The
-LangChain relevance-score adapter is available for cosine distance.
-
-Use :meth:`TypesenseVectorStore.from_client_params` for a convenience
-constructor, or pass an already configured synchronous client, asynchronous
-client, or both to
-:class:`TypesenseVectorStore` when connection lifecycle is managed by the
-application.
+Documents use configurable text, vector, and nested-metadata fields. Collections
+are managed lazily by default, and scored searches return raw Typesense distance.
 """
 
 from __future__ import annotations
@@ -83,27 +73,10 @@ DEFAULT_METADATA_KEY = "metadata"
 class TypesenseVectorStore(VectorStore):
     """LangChain vector store backed by Typesense.
 
-    LangChain metadata is kept under one nested object field. This prevents metadata
-    keys such as ``id`` or ``text`` from overwriting Typesense's internal fields.
-    Metadata is indexed by default so dictionary filters can target nested values.
-    Set ``index_metadata=False`` if metadata only needs to be stored and returned.
-
-    Args:
-        client: Configured synchronous Typesense client. May be omitted when an
-            asynchronous client is supplied and only async methods will be used.
-        embedding: Embedding model used for documents and queries.
-        collection_name: Typesense collection name.
-        async_client: Optional configured asynchronous Typesense client. When omitted,
-            LangChain async methods use a worker thread around the sync client.
-        text_key: Field used to store document text.
-        vector_key: Field used to store embeddings.
-        metadata_key: Nested object field used to store document metadata.
-        index_metadata: Whether a newly created collection indexes metadata fields.
-            Dictionary filters require indexed metadata. Raw Typesense filters remain
-            available for user-managed collection fields.
-        vec_dist: Typesense vector distance metric. ``"cosine"`` supports every
-            feature. ``"ip"`` supports raw-distance similarity search, but not
-            LangChain's cosine-based MMR or bounded relevance-score adapter.
+    Metadata is stored in one nested field, preventing keys such as ``id`` or
+    ``text`` from overwriting managed fields. It is indexed by default so mapping
+    filters can target nested values. ``"cosine"`` supports all features;
+    ``"ip"`` does not support MMR or bounded relevance scores.
     """
 
     def __init__(
@@ -119,29 +92,24 @@ class TypesenseVectorStore(VectorStore):
         index_metadata: bool = True,
         vec_dist: VectorDistance = "cosine",
     ) -> None:
-        """Initialize a store without making network requests.
+        """Initialize the store without network I/O.
 
-        Collection creation and schema validation are deferred until a
-        non-empty write, when the embedding dimension is known. Searches use an
-        existing collection as-is; Typesense errors propagate when it is absent.
+        Collection management is deferred until the first non-empty write.
 
         Args:
-            client: Configured synchronous Typesense client, or ``None`` for an
-                async-only store.
-            embedding: Embedding model used for document and query embeddings.
+            client: Configured sync client, or ``None`` for an async-only store.
+            embedding: Model used to embed documents and queries.
             collection_name: Typesense collection name.
-            async_client: Optional asynchronous client. If omitted, asynchronous
-                store methods execute their synchronous counterparts in a worker
-                thread.
-            text_key: Field used to store document text.
-            vector_key: Field used to store document embeddings.
-            metadata_key: Nested object field used to store document metadata.
-            index_metadata: Whether metadata fields in a newly created collection
-                should be indexed, enabling dictionary filters.
-            vec_dist: ``"cosine"`` or ``"ip"`` (inner product).
+            async_client: Optional async client. Without one, async methods run
+                their sync counterparts in a worker thread.
+            text_key: Field that stores document text.
+            vector_key: Field that stores embeddings.
+            metadata_key: Nested field that stores document metadata.
+            index_metadata: Whether newly created collections index metadata.
+            vec_dist: Vector distance metric: ``"cosine"`` or ``"ip"``.
 
         Raises:
-            ValueError: If no client is supplied, or configuration is invalid.
+            ValueError: If clients or configuration are invalid.
         """
         field_names = (text_key, vector_key, metadata_key)
         if not collection_name:
@@ -172,11 +140,7 @@ class TypesenseVectorStore(VectorStore):
 
     @property
     def client(self) -> Client | None:
-        """Return the configured synchronous Typesense client, if supplied.
-
-        This is the original client instance, not a copy. Calling :meth:`close`
-        closes its underlying HTTP resources.
-        """
+        """Return the configured synchronous client, if any."""
         return self._client
 
     @property
@@ -513,17 +477,16 @@ class TypesenseVectorStore(VectorStore):
             )
 
     def create_collection(self, num_dim: int) -> None:
-        """Create or validate the backing collection synchronously.
+        """Create the collection or validate its managed schema.
 
-        Creation is idempotent. An existing collection is not modified; instead,
-        its required fields, vector dimension, and distance metric are validated.
+        Successful validation is cached by dimension for this sync store instance.
 
         Args:
-            num_dim: Number of dimensions in the embeddings that will be stored.
+            num_dim: Embedding dimension expected by the vector field.
 
         Raises:
             ValueError: If ``num_dim`` is not positive.
-            TypesenseCollectionError: If an existing collection is incompatible.
+            TypesenseCollectionError: If the existing schema is incompatible.
         """
         if num_dim <= 0:
             raise ValueError("`num_dim` must be greater than 0.")
@@ -549,17 +512,17 @@ class TypesenseVectorStore(VectorStore):
         self._sync_validated_num_dim = num_dim
 
     async def acreate_collection(self, num_dim: int) -> None:
-        """Asynchronously create or validate the backing collection.
+        """Create or validate the collection asynchronously.
 
-        Uses the configured asynchronous client when available; otherwise it
-        delegates to :meth:`create_collection` in a worker thread.
+        Native async validation has its own dimension cache; otherwise the sync
+        method runs in a worker thread.
 
         Args:
-            num_dim: Number of dimensions in the embeddings that will be stored.
+            num_dim: Embedding dimension expected by the vector field.
 
         Raises:
             ValueError: If ``num_dim`` is not positive.
-            TypesenseCollectionError: If an existing collection is incompatible.
+            TypesenseCollectionError: If the existing schema is incompatible.
         """
         if self._async_client is None:
             await run_in_executor(None, self.create_collection, num_dim)
@@ -588,11 +551,10 @@ class TypesenseVectorStore(VectorStore):
         self._async_validated_num_dim = num_dim
 
     def delete_collection(self) -> bool:
-        """Delete the backing collection.
+        """Delete the collection.
 
         Returns:
-            ``True`` when the collection was deleted; ``False`` when it was
-            already absent.
+            Whether the collection existed.
         """
         try:
             self._require_sync_client().collections[self._collection_name].delete()
@@ -602,14 +564,10 @@ class TypesenseVectorStore(VectorStore):
         return True
 
     async def adelete_collection(self) -> bool:
-        """Asynchronously delete the backing collection.
-
-        If no asynchronous client is configured, the synchronous operation runs
-        in a worker thread. The method is idempotent for a missing collection.
+        """Delete the collection asynchronously.
 
         Returns:
-            ``True`` when the collection was deleted; ``False`` when it was
-            already absent.
+            Whether the collection existed.
         """
         if self._async_client is None:
             return await run_in_executor(None, self.delete_collection)
@@ -629,26 +587,32 @@ class TypesenseVectorStore(VectorStore):
         *,
         ids: list[str] | None = None,
         batch_size: int | None = None,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> list[str]:
-        """Embed and upsert LangChain documents into Typesense.
+        """Embed and upsert documents, returning their IDs.
 
-        The operation creates the collection lazily and uses Typesense's bulk
-        ``upsert`` action, so repeated IDs replace existing documents. Bulk
-        imports may partially succeed; in that case
-        :class:`TypesenseImportError` exposes the failed records.
+        By default, the first write creates or validates the collection. Set
+        ``create_collection_if_not_exists=False`` to skip that request for a
+        caller-managed collection. Bulk imports can partially succeed; failures
+        are reported by :class:`TypesenseImportError`.
 
         Args:
-            documents: Documents whose page content is embedded and stored.
-            ids: Optional stable Typesense IDs. Missing document IDs are replaced
-                with generated UUIDs.
-            batch_size: Optional number of records per Typesense import request.
+            documents: Documents to embed and store.
+            ids: Optional stable IDs. Missing IDs are generated.
+            batch_size: Optional records per import request.
+            create_collection_if_not_exists: Whether to create or validate the
+                collection before writing. Disable only for a caller-managed schema.
+
         Returns:
-            IDs assigned to the documents, in input order.
+            Document IDs in input order.
 
         Raises:
+            TypeError: If unsupported add options are supplied.
             ValueError: If IDs, batch size, or embeddings are invalid.
-            TypesenseImportError: If one or more records fail to import.
+            TypesenseCollectionError: If a managed collection is incompatible.
+            TypesenseImportError: If any records fail to import.
+            ObjectNotFound: If collection management is disabled and it is absent.
         """
         if kwargs:
             raise TypeError(f"Unsupported add options: {', '.join(sorted(kwargs))}")
@@ -664,12 +628,15 @@ class TypesenseVectorStore(VectorStore):
         resolved_ids, payload, num_dim = self._prepare_documents(documents, resolved_ids, vectors)
         if num_dim is None:  # pragma: no cover - guarded by the empty check above
             return []
-        self.create_collection(num_dim)
+        if create_collection_if_not_exists:
+            self.create_collection(num_dim)
         import_parameters: DocumentWriteParameters = {"action": "upsert"}
         documents_api = self._require_sync_client().collections[self._collection_name].documents
         try:
             response = documents_api.import_(payload, import_parameters, batch_size=batch_size)
         except ObjectNotFound:
+            if not create_collection_if_not_exists:
+                raise
             # Recover if the collection was removed after this store cached its
             # schema validation.
             self._sync_validated_num_dim = None
@@ -685,18 +652,28 @@ class TypesenseVectorStore(VectorStore):
         *,
         ids: list[str] | None = None,
         batch_size: int | None = None,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> list[str]:
-        """Embed and upsert text strings into Typesense.
+        """Embed and upsert texts.
 
         Args:
-            texts: Text content to embed and store.
-            metadatas: Optional metadata dictionaries aligned with ``texts``.
-            ids: Optional stable Typesense IDs aligned with ``texts``.
-            batch_size: Optional records per Typesense import request.
+            texts: Texts to embed and store.
+            metadatas: Optional metadata aligned with ``texts``.
+            ids: Optional stable IDs aligned with ``texts``.
+            batch_size: Optional records per import request.
+            create_collection_if_not_exists: Whether to create or validate the
+                collection before writing.
 
         Returns:
-            IDs assigned to the texts, in input order.
+            Document IDs in input order.
+
+        Raises:
+            TypeError: If unsupported add options are supplied.
+            ValueError: If inputs or embeddings are invalid.
+            TypesenseCollectionError: If a managed collection is incompatible.
+            TypesenseImportError: If any records fail to import.
+            ObjectNotFound: If collection management is disabled and it is absent.
         """
         if kwargs:
             raise TypeError(f"Unsupported add options: {', '.join(sorted(kwargs))}")
@@ -711,7 +688,12 @@ class TypesenseVectorStore(VectorStore):
             Document(page_content=text, metadata=metadata)
             for text, metadata in zip(text_list, metadata_list, strict=True)
         ]
-        return self.add_documents(documents, ids=ids, batch_size=batch_size)
+        return self.add_documents(
+            documents,
+            ids=ids,
+            batch_size=batch_size,
+            create_collection_if_not_exists=create_collection_if_not_exists,
+        )
 
     async def aadd_documents(
         self,
@@ -719,13 +701,13 @@ class TypesenseVectorStore(VectorStore):
         *,
         ids: list[str] | None = None,
         batch_size: int | None = None,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> list[str]:
-        """Asynchronously embed and upsert LangChain documents into Typesense.
+        """Embed and upsert documents asynchronously.
 
-        Uses native asynchronous embedding and Typesense clients when configured;
-        otherwise falls back to the synchronous implementation in a worker thread.
-        See :meth:`add_documents` for ID, batching, and partial-import behavior.
+        Parameters and errors match :meth:`add_documents`. Native async I/O is
+        used when configured; otherwise the sync method runs in a worker thread.
         """
         if self._async_client is None:
             return await run_in_executor(
@@ -734,6 +716,7 @@ class TypesenseVectorStore(VectorStore):
                 documents,
                 ids=ids,
                 batch_size=batch_size,
+                create_collection_if_not_exists=create_collection_if_not_exists,
                 **kwargs,
             )
         if kwargs:
@@ -752,7 +735,8 @@ class TypesenseVectorStore(VectorStore):
         resolved_ids, payload, num_dim = self._prepare_documents(documents, resolved_ids, vectors)
         if num_dim is None:  # pragma: no cover - guarded by the empty check above
             return []
-        await self.acreate_collection(num_dim)
+        if create_collection_if_not_exists:
+            await self.acreate_collection(num_dim)
         import_parameters: DocumentWriteParameters = {"action": "upsert"}
         documents_api = self._async_client.collections[self._collection_name].documents
         try:
@@ -760,6 +744,8 @@ class TypesenseVectorStore(VectorStore):
                 payload, import_parameters, batch_size=batch_size
             )
         except ObjectNotFound:
+            if not create_collection_if_not_exists:
+                raise
             self._async_validated_num_dim = None
             await self._acreate_missing_collection(num_dim)
             response = await documents_api.import_(
@@ -775,11 +761,12 @@ class TypesenseVectorStore(VectorStore):
         *,
         ids: list[str] | None = None,
         batch_size: int | None = None,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> list[str]:
-        """Asynchronously embed and upsert text strings into Typesense.
+        """Embed and upsert texts asynchronously.
 
-        See :meth:`add_texts` for metadata and ID alignment rules.
+        Parameters and errors match :meth:`add_texts`.
         """
         if kwargs:
             raise TypeError(f"Unsupported add options: {', '.join(sorted(kwargs))}")
@@ -794,7 +781,12 @@ class TypesenseVectorStore(VectorStore):
             Document(page_content=text, metadata=metadata)
             for text, metadata in zip(text_list, metadata_list, strict=True)
         ]
-        return await self.aadd_documents(documents, ids=ids, batch_size=batch_size)
+        return await self.aadd_documents(
+            documents,
+            ids=ids,
+            batch_size=batch_size,
+            create_collection_if_not_exists=create_collection_if_not_exists,
+        )
 
     # ------------------------------------------------------------------
     # Search
@@ -888,20 +880,23 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Return documents nearest to a text query.
+        """Return documents nearest to an embedded text query.
 
         Args:
             query: Text to embed and search for.
-            k: Maximum number of documents to return.
-            filter: Metadata equality mapping or raw Typesense ``filter_by``
-                expression.
-            search_parameters: Additional non-managed Typesense search parameters.
+            k: Maximum results to return.
+            filter: Metadata mapping or raw Typesense filter expression.
+            search_parameters: Additional safe Typesense search options.
             distance_threshold: Optional maximum vector distance.
             ef: Optional HNSW search expansion factor.
-            flat_search_cutoff: Optional threshold for exact flat search.
+            flat_search_cutoff: Optional exact-search cutoff.
+
         Returns:
-            Documents in Typesense result order. This is increasing vector
-            distance unless explicit curation options reorder the hits.
+            Documents in Typesense result order.
+
+        Raises:
+            TypeError: If unsupported search options are supplied.
+            ValueError: If search options are invalid.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -932,22 +927,24 @@ class TypesenseVectorStore(VectorStore):
     ) -> list[tuple[Document, float]]:
         """Return documents with raw Typesense vector distances.
 
-        The second tuple item is a distance, not a LangChain relevance score:
-        lower values indicate more similar documents. Use the inherited
-        :meth:`similarity_search_with_relevance_scores` method when a bounded
-        relevance score is required.
+        Lower distance is better. Use
+        :meth:`similarity_search_with_relevance_scores` for bounded cosine scores.
 
         Args:
             query: Text to embed and search for.
-            k: Maximum number of results.
-            filter: Metadata equality mapping or raw Typesense filter expression.
-            search_parameters: Additional non-managed Typesense parameters.
+            k: Maximum results to return.
+            filter: Metadata mapping or raw Typesense filter expression.
+            search_parameters: Additional safe Typesense search options.
             distance_threshold: Optional maximum vector distance.
             ef: Optional HNSW search expansion factor.
             flat_search_cutoff: Optional exact-search cutoff.
+
         Returns:
-            ``(Document, distance)`` pairs in Typesense result order. This is
-            nearest to farthest unless explicit curation options reorder the hits.
+            ``(document, distance)`` pairs in Typesense result order.
+
+        Raises:
+            TypeError: If unsupported search options are supplied.
+            ValueError: If search options are invalid.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -981,19 +978,23 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Return documents nearest to a caller-supplied embedding.
+        """Return documents nearest to an embedding vector.
 
         Args:
-            embedding: Query vector. Its dimension must match the collection.
-            k: Maximum number of documents to return.
-            filter: Metadata equality mapping or raw Typesense filter expression.
-            search_parameters: Additional non-managed Typesense parameters.
+            embedding: Query vector matching the collection dimension.
+            k: Maximum results to return.
+            filter: Metadata mapping or raw Typesense filter expression.
+            search_parameters: Additional safe Typesense search options.
             distance_threshold: Optional maximum vector distance.
             ef: Optional HNSW search expansion factor.
             flat_search_cutoff: Optional exact-search cutoff.
+
         Returns:
-            Documents in Typesense result order. This is increasing vector
-            distance unless explicit curation options reorder the hits.
+            Documents in Typesense result order.
+
+        Raises:
+            TypeError: If unsupported search options are supplied.
+            ValueError: If search options are invalid.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1060,11 +1061,10 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Asynchronously return documents nearest to a text query.
+        """Return documents nearest to an embedded text query asynchronously.
 
-        Parameters match :meth:`similarity_search`; native asynchronous embedding
-        and Typesense I/O are used when an async client was configured. Otherwise,
-        the synchronous implementation runs in a worker thread.
+        Parameters match :meth:`similarity_search`. Native async I/O is used when
+        configured; otherwise the sync method runs in a worker thread.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1093,11 +1093,10 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
-        """Asynchronously return documents and raw vector distances.
+        """Return documents and raw distances asynchronously.
 
-        The returned Typesense distances use the configured metric; lower is
-        better. Parameters match :meth:`similarity_search_with_score`. Without an
-        async client, the synchronous implementation runs in a worker thread.
+        Parameters match :meth:`similarity_search_with_score`; lower distance is
+        better. Without an async client, the sync method runs in a worker thread.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1143,10 +1142,9 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Asynchronously return documents nearest to an embedding vector.
+        """Return documents nearest to an embedding vector asynchronously.
 
-        Parameters match :meth:`similarity_search_by_vector`. Without an async
-        client, the synchronous implementation runs in a worker thread.
+        Parameters match :meth:`similarity_search_by_vector`.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1183,9 +1181,7 @@ class TypesenseVectorStore(VectorStore):
     ) -> list[Document]:
         """Return documents ranked by Typesense keyword/vector rank fusion.
 
-        ``alpha`` is the vector-ranking weight: ``0`` favors keyword ranking and
-        ``1`` favors vector ranking. Keyword search targets the configured text
-        field unless ``query_by`` supplies other indexed string fields.
+        Parameters match :meth:`hybrid_search_with_score`; scores are omitted.
         """
         if kwargs:
             raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
@@ -1220,9 +1216,25 @@ class TypesenseVectorStore(VectorStore):
     ) -> list[tuple[Document, float]]:
         """Return documents with Typesense rank-fusion scores.
 
-        Higher fusion scores rank first. They are rank-dependent hybrid scores,
-        not raw vector distances or normalized LangChain relevance scores, and
-        should not be compared across separate searches.
+        Higher is better. Scores are query-specific, not normalized relevance.
+
+        Args:
+            query: Text used for keyword and vector search.
+            k: Maximum results to return.
+            alpha: Vector weight from ``0`` (keyword) to ``1`` (vector).
+            query_by: Keyword fields. Defaults to the configured text field.
+            filter: Metadata mapping or raw Typesense filter expression.
+            search_parameters: Additional safe hybrid-search options.
+            distance_threshold: Optional maximum vector distance.
+            ef: Optional HNSW search expansion factor.
+            flat_search_cutoff: Optional exact-search cutoff.
+
+        Returns:
+            ``(document, fusion_score)`` pairs in rank-fusion order.
+
+        Raises:
+            TypeError: If unsupported hybrid-search options are supplied.
+            ValueError: If hybrid-search options are invalid.
         """
         if kwargs:
             raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
@@ -1266,7 +1278,10 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Asynchronously return documents ranked by keyword/vector fusion."""
+        """Return documents ranked by keyword/vector fusion asynchronously.
+
+        Parameters match :meth:`hybrid_search`.
+        """
         if kwargs:
             raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
         return [
@@ -1298,7 +1313,10 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
-        """Asynchronously return documents with rank-fusion scores."""
+        """Return documents with rank-fusion scores asynchronously.
+
+        Parameters match :meth:`hybrid_search_with_score`.
+        """
         if kwargs:
             raise TypeError(f"Unsupported hybrid search options: {', '.join(sorted(kwargs))}")
         if self._async_client is None:
@@ -1393,26 +1411,28 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Return diverse documents selected with maximal marginal relevance.
+        """Return documents selected with maximal marginal relevance.
 
-        ``fetch_k`` candidates are retrieved from Typesense, then reranked locally
-        using LangChain's MMR implementation. ``lambda_mult=1`` favors query
-        similarity, while ``lambda_mult=0`` favors diversity.
+        Typesense returns ``fetch_k`` candidates for local reranking.
+        ``lambda_mult=1`` favors similarity; ``0`` favors diversity.
 
         Args:
             query: Text to embed and search for.
-            k: Number of diverse documents to return.
-            fetch_k: Number of candidates to fetch before local reranking.
-            lambda_mult: Similarity/diversity trade-off in the inclusive range
-                ``[0, 1]``.
-            filter: Metadata equality mapping or raw Typesense filter expression.
-            search_parameters: Additional non-managed Typesense parameters.
+            k: Maximum documents to return.
+            fetch_k: Candidates to fetch before local reranking.
+            lambda_mult: Similarity/diversity weight in ``[0, 1]``.
+            filter: Metadata mapping or raw Typesense filter expression.
+            search_parameters: Additional safe Typesense search options.
             distance_threshold: Optional maximum vector distance.
             ef: Optional HNSW search expansion factor.
             flat_search_cutoff: Optional exact-search cutoff.
 
         Returns:
-            Up to ``k`` documents selected by MMR.
+            Up to ``k`` MMR-selected documents.
+
+        Raises:
+            TypeError: If unsupported search options are supplied.
+            ValueError: If options are invalid or cosine distance is not configured.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1447,21 +1467,25 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Return diverse documents for a caller-supplied embedding.
+        """Return MMR-selected documents for an embedding vector.
 
         Args:
-            embedding: Query vector whose dimension matches the collection.
-            k: Number of diverse documents to return.
-            fetch_k: Number of candidates fetched before local MMR reranking.
-            lambda_mult: Similarity/diversity trade-off in ``[0, 1]``.
-            filter: Metadata equality mapping or raw Typesense filter expression.
-            search_parameters: Additional non-managed Typesense parameters.
+            embedding: Query vector matching the collection dimension.
+            k: Maximum documents to return.
+            fetch_k: Candidates to fetch before local reranking.
+            lambda_mult: Similarity/diversity weight in ``[0, 1]``.
+            filter: Metadata mapping or raw Typesense filter expression.
+            search_parameters: Additional safe Typesense search options.
             distance_threshold: Optional maximum vector distance.
             ef: Optional HNSW search expansion factor.
             flat_search_cutoff: Optional exact-search cutoff.
 
         Returns:
-            Up to ``k`` documents selected by local MMR reranking.
+            Up to ``k`` MMR-selected documents.
+
+        Raises:
+            TypeError: If unsupported search options are supplied.
+            ValueError: If options are invalid or cosine distance is not configured.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1500,11 +1524,9 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Asynchronously return documents selected with MMR.
+        """Return MMR-selected documents for a text query asynchronously.
 
-        Parameters and reranking semantics match
-        :meth:`max_marginal_relevance_search`. Without an async client, the
-        synchronous implementation runs in a worker thread.
+        Parameters match :meth:`max_marginal_relevance_search`.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1553,11 +1575,9 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Asynchronously return diverse documents for an embedding vector.
+        """Return MMR-selected documents for an embedding asynchronously.
 
-        Parameters and reranking semantics match
-        :meth:`max_marginal_relevance_search_by_vector`. Without an async client,
-        the synchronous implementation runs in a worker thread.
+        Parameters match :meth:`max_marginal_relevance_search_by_vector`.
         """
         if kwargs:
             raise TypeError(f"Unsupported search options: {', '.join(sorted(kwargs))}")
@@ -1627,16 +1647,17 @@ class TypesenseVectorStore(VectorStore):
     def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
         """Return found documents for the supplied IDs.
 
-        IDs are de-duplicated and missing documents are ignored, matching
-        LangChain's ``get_by_ids`` contract. This implementation currently
-        preserves first-seen order, but callers should not depend on result order.
+        Duplicate IDs are collapsed and missing documents are ignored. Result order
+        is not part of the contract.
 
         Args:
             ids: Typesense document IDs to retrieve.
 
         Returns:
-            Found documents. The result may be shorter than ``ids`` and its order
-            is not part of the public contract.
+            Found documents, which may be fewer than requested.
+
+        Raises:
+            ValueError: If an ID is invalid.
         """
         if not ids:
             return []
@@ -1649,10 +1670,9 @@ class TypesenseVectorStore(VectorStore):
         return self._documents_in_requested_order(self._parse_export_response(response), unique_ids)
 
     async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
-        """Asynchronously return found documents for the supplied IDs.
+        """Return found documents for the supplied IDs asynchronously.
 
-        Missing documents are ignored and duplicate IDs are de-duplicated. Uses
-        native asynchronous retrieval when configured, otherwise a worker thread.
+        Parameters and ordering semantics match :meth:`get_by_ids`.
         """
         if self._async_client is None:
             return await run_in_executor(None, self.get_by_ids, ids)
@@ -1673,15 +1693,21 @@ class TypesenseVectorStore(VectorStore):
         delete_all_documents: bool = False,
         **kwargs: Any,
     ) -> bool:
-        """Delete selected documents, with an explicit guard for truncation.
+        """Delete documents.
+
+        ``ids=None`` requires ``delete_all_documents=True`` to prevent accidental
+        truncation. An empty ID list is a no-op.
 
         Args:
-            ids: IDs to delete. An empty list is a no-op. ``None`` requires
-                ``delete_all_documents=True`` and truncates every document.
-            delete_all_documents: Explicit confirmation for collection truncation.
+            ids: IDs to delete, an empty list for a no-op, or ``None`` to truncate.
+            delete_all_documents: Required confirmation when ``ids`` is ``None``.
 
         Returns:
-            ``True`` after a successful request.
+            ``True`` after a successful request or no-op.
+
+        Raises:
+            TypeError: If unsupported delete options are supplied.
+            ValueError: If arguments or IDs are invalid.
         """
         if kwargs:
             raise TypeError(f"Unsupported delete options: {', '.join(sorted(kwargs))}")
@@ -1708,11 +1734,9 @@ class TypesenseVectorStore(VectorStore):
         delete_all_documents: bool = False,
         **kwargs: Any,
     ) -> bool:
-        """Asynchronously delete documents, with guarded truncation.
+        """Delete documents asynchronously.
 
-        Parameters and error behavior match :meth:`delete`. Native asynchronous
-        I/O is used when configured; otherwise a worker thread runs the
-        synchronous operation.
+        Parameters and truncation safeguards match :meth:`delete`.
         """
         if kwargs:
             raise TypeError(f"Unsupported delete options: {', '.join(sorted(kwargs))}")
@@ -1762,26 +1786,24 @@ class TypesenseVectorStore(VectorStore):
     ) -> TypesenseVectorStore:
         """Build a store and clients from Typesense connection parameters.
 
-        ``client_mode`` controls which connection pools are created. ``api_key``
-        falls back to ``TYPESENSE_API_KEY`` only when omitted.
+        ``client_mode`` selects the connection pools. A missing ``api_key`` uses
+        ``TYPESENSE_API_KEY``; URL ports default to 80 for HTTP and 443 for HTTPS.
 
         Args:
-            embedding: Embedding model used by the returned store.
-            typesense_url: Absolute Typesense HTTP(S) URL. Port 80 is inferred for
-                HTTP and port 443 for HTTPS when the URL omits a port. An explicit
-                port is preserved.
+            embedding: Model used to embed documents and queries.
+            typesense_url: Absolute Typesense HTTP(S) URL.
             api_key: Typesense API key.
-            client_mode: Create a sync client (the default), async client, or both.
+            client_mode: Whether to create sync, async, or both clients.
             connection_timeout_seconds: Client request timeout.
-            collection_name: Backing collection name.
-            text_key: Typesense field used for LangChain ``page_content``.
-            vector_key: Typesense vector field.
-            metadata_key: Typesense nested metadata field.
-            index_metadata: Whether newly created metadata is indexed.
-            vec_dist: Typesense vector metric, ``"cosine"`` or ``"ip"``.
+            collection_name: Typesense collection name.
+            text_key: Field that stores document text.
+            vector_key: Field that stores embeddings.
+            metadata_key: Nested field that stores document metadata.
+            index_metadata: Whether newly created collections index metadata.
+            vec_dist: Vector distance metric: ``"cosine"`` or ``"ip"``.
 
         Returns:
-            A store with the requested client connection pool(s).
+            A store with the requested client connection pools.
 
         Raises:
             ValueError: If the URL, API key, mode, or timeout is invalid.
@@ -1817,14 +1839,13 @@ class TypesenseVectorStore(VectorStore):
         cls,
         documents: list[Document],
         embedding: Embeddings,
+        *,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> TypesenseVectorStore:
-        """Create a populated store from documents and their metadata.
+        """Create a populated store, generating only missing document IDs.
 
-        LangChain's base implementation passes every document ID when at least
-        one document has an ID.  That includes ``None`` for mixed-ID batches,
-        which Typesense cannot accept.  Generate IDs only for the missing entries
-        while preserving every caller-provided ID.
+        Other parameters and errors match :meth:`from_texts`.
         """
         texts = [document.page_content for document in documents]
         metadatas = [document.metadata for document in documents]
@@ -1832,19 +1853,27 @@ class TypesenseVectorStore(VectorStore):
             document_ids = [document.id for document in documents]
             if any(document_ids):
                 kwargs["ids"] = [document_id or str(uuid.uuid4()) for document_id in document_ids]
-        return cls.from_texts(texts, embedding, metadatas=metadatas, **kwargs)
+        return cls.from_texts(
+            texts,
+            embedding,
+            metadatas=metadatas,
+            create_collection_if_not_exists=create_collection_if_not_exists,
+            **kwargs,
+        )
 
     @classmethod
     async def afrom_documents(
         cls,
         documents: list[Document],
         embedding: Embeddings,
+        *,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> TypesenseVectorStore:
-        """Asynchronously create a populated store from documents.
+        """Create a populated store asynchronously.
 
-        Mixed batches use generated IDs for documents without IDs, matching
-        :meth:`from_documents` while retaining IDs supplied by the caller.
+        Missing document IDs are generated. Other parameters and errors match
+        :meth:`afrom_texts`.
         """
         texts = [document.page_content for document in documents]
         metadatas = [document.metadata for document in documents]
@@ -1852,7 +1881,13 @@ class TypesenseVectorStore(VectorStore):
             document_ids = [document.id for document in documents]
             if any(document_ids):
                 kwargs["ids"] = [document_id or str(uuid.uuid4()) for document_id in document_ids]
-        return await cls.afrom_texts(texts, embedding, metadatas=metadatas, **kwargs)
+        return await cls.afrom_texts(
+            texts,
+            embedding,
+            metadatas=metadatas,
+            create_collection_if_not_exists=create_collection_if_not_exists,
+            **kwargs,
+        )
 
     @classmethod
     async def afrom_texts(
@@ -1871,9 +1906,14 @@ class TypesenseVectorStore(VectorStore):
         index_metadata: bool = True,
         vec_dist: VectorDistance = "cosine",
         batch_size: int | None = None,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> TypesenseVectorStore:
-        """Create a store and add texts using native async I/O when available."""
+        """Create a store and add texts asynchronously.
+
+        Parameters and errors match :meth:`from_texts`. Native async I/O is used
+        when an async client is configured.
+        """
         if kwargs:
             raise TypeError(f"Unsupported constructor options: {', '.join(sorted(kwargs))}")
         store = cls(
@@ -1887,7 +1927,13 @@ class TypesenseVectorStore(VectorStore):
             index_metadata=index_metadata,
             vec_dist=vec_dist,
         )
-        await store.aadd_texts(texts, metadatas=metadatas, ids=ids, batch_size=batch_size)
+        await store.aadd_texts(
+            texts,
+            metadatas=metadatas,
+            ids=ids,
+            batch_size=batch_size,
+            create_collection_if_not_exists=create_collection_if_not_exists,
+        )
         return store
 
     @classmethod
@@ -1907,34 +1953,38 @@ class TypesenseVectorStore(VectorStore):
         index_metadata: bool = True,
         vec_dist: VectorDistance = "cosine",
         batch_size: int | None = None,
+        create_collection_if_not_exists: bool = True,
         **kwargs: Any,
     ) -> TypesenseVectorStore:
-        """Create a store and immediately add texts using an existing client.
-
-        This helper is useful for applications that already manage a configured
-        Typesense client. The collection is created lazily by the initial write.
+        """Create a store and add texts with an existing sync client.
 
         Args:
-            texts: Text strings to embed and store.
-            embedding: Embedding model used for the texts.
-            metadatas: Optional metadata dictionaries aligned with ``texts``.
+            texts: Texts to embed and store.
+            embedding: Model used to embed the texts.
+            metadatas: Optional metadata aligned with ``texts``.
             ids: Optional stable IDs aligned with ``texts``.
             client: Configured synchronous Typesense client.
-            async_client: Optional configured asynchronous Typesense client.
-            collection_name: Backing collection name.
-            text_key: Typesense field used for LangChain ``page_content``.
-            vector_key: Typesense vector field.
-            metadata_key: Typesense nested metadata field.
-            index_metadata: Whether newly created metadata is indexed.
-            vec_dist: Typesense vector metric.
-            batch_size: Optional records per Typesense import request.
+            async_client: Optional async client for later async methods.
+            collection_name: Typesense collection name.
+            text_key: Field that stores document text.
+            vector_key: Field that stores embeddings.
+            metadata_key: Nested field that stores document metadata.
+            index_metadata: Whether newly created collections index metadata.
+            vec_dist: Vector distance metric.
+            batch_size: Optional records per import request.
+            create_collection_if_not_exists: Whether to create or validate the
+                collection before writing.
+            **kwargs: Reserved for LangChain compatibility; unsupported options fail.
 
         Returns:
-            A populated :class:`TypesenseVectorStore`.
+            A populated store.
 
         Raises:
-            ValueError: If input lengths or configuration are invalid.
-            TypesenseImportError: If Typesense partially rejects the import.
+            TypeError: If unsupported constructor options are supplied.
+            ValueError: If inputs or configuration are invalid.
+            TypesenseCollectionError: If a managed collection is incompatible.
+            TypesenseImportError: If any records fail to import.
+            ObjectNotFound: If collection management is disabled and it is absent.
         """
         if kwargs:
             raise TypeError(f"Unsupported constructor options: {', '.join(sorted(kwargs))}")
@@ -1951,7 +2001,13 @@ class TypesenseVectorStore(VectorStore):
             index_metadata=index_metadata,
             vec_dist=vec_dist,
         )
-        store.add_texts(texts, metadatas=metadatas, ids=ids, batch_size=batch_size)
+        store.add_texts(
+            texts,
+            metadatas=metadatas,
+            ids=ids,
+            batch_size=batch_size,
+            create_collection_if_not_exists=create_collection_if_not_exists,
+        )
         return store
 
 

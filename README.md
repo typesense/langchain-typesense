@@ -65,7 +65,7 @@ print(matches)
 store.close()
 ```
 
-The first non-empty write creates the collection or validates its existing schema. Later
+By default, the first non-empty write creates the collection or validates its schema. Later
 writes from the same store instance reuse the validation result.
 
 ## Configure the store
@@ -189,12 +189,22 @@ are generated as UUIDs. IDs may contain only URL-unreserved characters. Reusing 
 upserts the document. For multi-request imports, explicit stable IDs make retries easier
 to reconcile.
 
-Before the first import, the store retrieves or creates the collection and validates its
-schema. Importing first would not safely replace that check: an existing collection can
-accept a document while still using the wrong distance metric or metadata indexing. The
-validated dimension is cached, so later writes skip the schema request. If someone deletes
-the collection between writes, the store handles the import's not-found response, recreates
-the collection, and retries once.
+By default, the first import retrieves or creates the collection and validates its schema.
+The validated dimension is cached, so later writes through the same store and client path
+skip that request. The store also recreates a collection deleted between managed writes.
+
+For a caller-managed collection, skip creation and validation—and their first-write API
+request—with `create_collection_if_not_exists=False`:
+
+```python
+store.add_documents(
+    documents,
+    create_collection_if_not_exists=False,
+)
+```
+
+In this mode, the write fails normally if the collection is missing or incompatible. The
+flag is also available on sync and async text helpers and factories.
 
 The async methods are `aadd_documents` and `aadd_texts`. One-step factories are also
 available:

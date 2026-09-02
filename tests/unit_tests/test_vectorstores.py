@@ -378,6 +378,37 @@ def test_schema_validation_is_cached_and_recovers_after_collection_removal() -> 
     assert collection.documents.import_.call_count == 3
 
 
+def test_add_documents_can_skip_collection_management() -> None:
+    store, collections, collection = make_sync_store()
+    collection.documents.import_.return_value = [{"success": True}]
+
+    assert store.add_documents(
+        [Document(page_content="alpha")],
+        ids=["doc-1"],
+        create_collection_if_not_exists=False,
+    ) == ["doc-1"]
+
+    collection.retrieve.assert_not_called()
+    collections.create.assert_not_called()
+    collection.documents.import_.assert_called_once()
+
+
+def test_add_documents_does_not_recover_missing_managed_collection() -> None:
+    store, collections, collection = make_sync_store()
+    collection.documents.import_.side_effect = ObjectNotFound("missing")
+
+    with pytest.raises(ObjectNotFound, match="missing"):
+        store.add_texts(
+            ["alpha"],
+            ids=["doc-1"],
+            create_collection_if_not_exists=False,
+        )
+
+    collection.retrieve.assert_not_called()
+    collections.create.assert_not_called()
+    collection.documents.import_.assert_called_once()
+
+
 def test_similarity_search_builds_bounded_query_and_restores_metadata() -> None:
     store, _, collection = make_sync_store()
     collection.documents.search.return_value = search_response()
@@ -907,9 +938,11 @@ def test_from_documents_generates_only_missing_mixed_ids() -> None:
         documents,
         FakeEmbeddings(),
         client=cast(Client, client),
+        create_collection_if_not_exists=False,
     )
 
     assert store.client is client
+    collection.retrieve.assert_not_called()
     payload = collection.documents.import_.call_args.args[0]
     assert payload[0]["id"] == "provided"
     UUID(payload[1]["id"])
@@ -1039,3 +1072,20 @@ async def test_native_async_add_and_search() -> None:
     hybrid_parameters = collection.documents.search.await_args_list[1].args[0]
     assert hybrid_parameters["q"] == "bar"
     assert "alpha:0.8" in hybrid_parameters["vector_query"]
+
+
+@pytest.mark.asyncio
+async def test_native_async_add_can_skip_collection_management() -> None:
+    store, collections, collection = make_async_store()
+    collection.retrieve = AsyncMock()
+    collection.documents.import_ = AsyncMock(return_value=[{"success": True}])
+
+    assert await store.aadd_texts(
+        ["bar"],
+        ids=["doc-1"],
+        create_collection_if_not_exists=False,
+    ) == ["doc-1"]
+
+    collection.retrieve.assert_not_awaited()
+    collections.create.assert_not_called()
+    collection.documents.import_.assert_awaited_once()
