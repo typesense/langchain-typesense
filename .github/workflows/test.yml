@@ -48,11 +48,15 @@ jobs:
     services:
       typesense:
         image: typesense/typesense:30.2
-        env:
-          TYPESENSE_API_KEY: xyz
-          TYPESENSE_DATA_DIR: /data
         ports:
-          - 8108:8108
+          - 8108:8108/tcp
+        volumes:
+          - /tmp/typesense-server-data:/data
+        env:
+          TYPESENSE_DATA_DIR: '/data'
+          TYPESENSE_API_KEY: 'xyz'
+          TYPESENSE_ENABLE_CORS: true
+          TYPESENSE_URL: 'http://localhost:8108'
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
