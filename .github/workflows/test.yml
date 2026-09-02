@@ -33,7 +33,7 @@ jobs:
       - name: Type check
         run: uv run --locked --group lint mypy langchain_typesense
       - name: Ty check
-        run: uv run --locked --group lint ty check
+        run: uv run --locked --group lint ty check langchain_typesense
       - name: Unit tests
         run: >-
           uv run --locked --group test pytest --disable-socket

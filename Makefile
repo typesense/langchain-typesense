@@ -9,7 +9,7 @@ integration_test:
 lint:
 	uv run --group lint ruff check .
 	uv run --group lint mypy langchain_typesense
-	uv run --group lint ty check
+	uv run --group lint ty check langchain_typesense
 
 format:
 	uv run --group lint ruff check --fix .
