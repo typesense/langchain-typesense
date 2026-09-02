@@ -14,10 +14,12 @@ from langchain_core.vectorstores import VectorStore
 from typesense import AsyncClient, Client
 from typesense.exceptions import ObjectAlreadyExists, ObjectNotFound
 
+import langchain_typesense.vectorstores as vectorstores
 from langchain_typesense import (
     TypesenseCollectionError,
     TypesenseHybridSearchParameters,
     TypesenseImportError,
+    TypesenseSearchParameters,
     TypesenseVectorStore,
     TypesenseVectorStoreError,
 )
@@ -134,6 +136,10 @@ def test_typesense_vectorstore_is_a_vectorstore() -> None:
     assert store.collection_name == "test-collection"
     assert store.embeddings is not None
     assert TypesenseHybridSearchParameters.__name__ == "TypesenseHybridSearchParameters"
+    assert TypesenseSearchParameters is vectorstores.TypesenseSearchParameters
+    assert TypesenseHybridSearchParameters is vectorstores.TypesenseHybridSearchParameters
+    assert TypesenseCollectionError is vectorstores.TypesenseCollectionError
+    assert TypesenseImportError is vectorstores.TypesenseImportError
 
 
 def test_constructor_rejects_reserved_or_duplicate_fields() -> None:
@@ -160,6 +166,8 @@ def test_dict_filter_targets_nested_metadata_and_escapes_values() -> None:
         "metadata.category:=[`Running Shoes`,Boots]"
     )
     assert store._to_filter_by({"published": True}) == "metadata.published:=true"
+    with pytest.raises(TypeError, match="Unsupported Typesense filter value"):
+        store._to_filter_by(cast(Any, {"source": None}))
 
 
 def test_string_filter_passes_through_unchanged() -> None:
@@ -294,6 +302,12 @@ def test_add_documents_validates_existing_collection_schema() -> None:
     collection.retrieve.return_value = fractional_schema
     with pytest.raises(TypesenseCollectionError, match="num_dim=3"):
         store.create_collection(3)
+
+    boolean_schema = collection_schema(num_dim=1)
+    boolean_schema["fields"][1]["num_dim"] = True
+    collection.retrieve.return_value = boolean_schema
+    with pytest.raises(TypesenseCollectionError, match="num_dim=1"):
+        store.create_collection(1)
 
 
 @pytest.mark.parametrize(
@@ -448,13 +462,14 @@ def test_v30_curation_search_parameters_are_forwarded() -> None:
 @pytest.mark.parametrize(
     "response",
     [
+        "not-an-object",
         {"grouped_hits": []},
         {"hits": {}},
         {"hits": [{"document": {}}]},
     ],
 )
 def test_similarity_search_rejects_malformed_typesense_responses(
-    response: dict[str, Any],
+    response: object,
 ) -> None:
     store, _, collection = make_sync_store()
     collection.documents.search.return_value = response
@@ -632,6 +647,7 @@ def test_hybrid_search_rejects_managed_or_contract_breaking_parameters(parameter
 @pytest.mark.parametrize(
     "response",
     [
+        "not-an-object",
         {},
         {"hits": {}},
         {"hits": [None]},
@@ -654,7 +670,7 @@ def test_hybrid_search_rejects_managed_or_contract_breaking_parameters(parameter
         },
     ],
 )
-def test_hybrid_search_rejects_malformed_responses(response: dict[str, Any]) -> None:
+def test_hybrid_search_rejects_malformed_responses(response: object) -> None:
     store, _, collection = make_sync_store()
     collection.documents.search.return_value = response
 

@@ -1,16 +1,17 @@
 from importlib import metadata
 
-from langchain_typesense.vectorstores import (
-    ClientMode,
-    Typesense,
+from langchain_typesense._errors import (
     TypesenseCollectionError,
-    TypesenseHybridSearchParameters,
     TypesenseImportError,
-    TypesenseSearchParameters,
-    TypesenseVectorStore,
     TypesenseVectorStoreError,
+)
+from langchain_typesense._types import (
+    ClientMode,
+    TypesenseHybridSearchParameters,
+    TypesenseSearchParameters,
     VectorDistance,
 )
+from langchain_typesense.vectorstores import Typesense, TypesenseVectorStore
 
 try:
     __version__ = metadata.version("langchain-typesense")

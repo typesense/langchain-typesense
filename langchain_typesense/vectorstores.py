@@ -16,13 +16,10 @@ application.
 
 from __future__ import annotations
 
-import json
 import math
-import re
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, Literal, TypeAlias, TypedDict, cast
-from urllib.parse import quote, urlparse
+from typing import Any, cast
 
 import numpy as np
 from langchain_core.documents import Document
@@ -32,7 +29,7 @@ from langchain_core.utils import get_from_env
 from langchain_core.vectorstores import VectorStore
 from langchain_core.vectorstores.utils import maximal_marginal_relevance
 from typesense import AsyncClient, Client
-from typesense.configuration import ConfigDict, NodeConfigDict
+from typesense.configuration import ConfigDict
 from typesense.exceptions import ObjectAlreadyExists, ObjectNotFound
 from typesense.types.collection import CollectionCreateSchema, CollectionSchema
 from typesense.types.document import (
@@ -42,168 +39,45 @@ from typesense.types.document import (
     SearchParameters,
 )
 
+from langchain_typesense._codec import (
+    build_vector_query,
+    document_from_typesense,
+    encode_filter_value,
+    ids_filter,
+    node_from_url,
+    normalize_hybrid_query_by,
+    parse_export_response,
+    parse_hybrid_search_response,
+    parse_search_response,
+    raise_for_import_failures,
+    resolve_ids,
+    to_filter_by,
+    validate_hybrid_query,
+    validate_id,
+    validate_k,
+    validate_vector_query_options,
+    validate_vectors,
+)
+from langchain_typesense._errors import (
+    TypesenseCollectionError,
+    TypesenseImportError,
+    TypesenseVectorStoreError,
+)
+from langchain_typesense._types import (
+    MANAGED_SEARCH_PARAMETERS,
+    SAFE_HYBRID_SEARCH_PARAMETERS,
+    SAFE_SEARCH_PARAMETERS,
+    ClientMode,
+    Filter,
+    TypesenseHybridSearchParameters,
+    TypesenseSearchParameters,
+    VectorDistance,
+)
+
 DEFAULT_COLLECTION_NAME = "langchain-typesense"
 DEFAULT_TEXT_KEY = "text"
 DEFAULT_VECTOR_KEY = "vec"
 DEFAULT_METADATA_KEY = "metadata"
-
-FilterScalar: TypeAlias = str | int | float | bool
-FilterValue: TypeAlias = FilterScalar | Sequence[FilterScalar]
-Filter: TypeAlias = str | Mapping[str, FilterValue]
-VectorDistance: TypeAlias = Literal["cosine", "ip"]
-ClientMode: TypeAlias = Literal["sync", "async", "both"]
-
-
-class TypesenseSearchParameters(TypedDict, total=False):
-    """Safe Typesense search options that can be forwarded by this adapter.
-
-    The integration owns the query, vector query, pagination, filtering, and
-    returned-field selection. Options that can change the response shape or
-    replace vector-distance ordering are intentionally not part of this type.
-    The remaining fields tune filtering/search execution or add ignored metadata
-    (facets/highlights) without changing the hit representation consumed by the
-    adapter.  ``curation_tags`` and ``diversity_lambda`` are retained as explicit
-    opt-in Typesense curation controls; they may change ranking, but do not alter
-    the response shape or local MMR contract.
-    """
-
-    max_filter_by_candidates: int
-    enable_lazy_filter: bool
-    facet_by: str | list[str]
-    max_facet_values: int
-    facet_query: str
-    facet_query_num_typos: int
-    facet_return_parent: str
-    facet_sample_percent: int
-    facet_sample_threshold: int
-    facet_strategy: Literal["exhaustive", "top_values", "automatic"]
-    highlight_fields: Literal["none"] | str | list[str]
-    highlight_full_fields: Literal["none"] | str | list[str]
-    highlight_affix_num_tokens: int
-    highlight_start_tag: str
-    highlight_end_tag: str
-    enable_highlight_v1: bool
-    snippet_threshold: int
-    limit_hits: int
-    search_cutoff_ms: int
-    exhaustive_search: bool
-    use_cache: bool
-    cache_ttl: int
-    curation_tags: str
-    diversity_lambda: float
-
-
-class TypesenseHybridSearchParameters(TypesenseSearchParameters, total=False):
-    """Safe Typesense options for the keyword side of hybrid search.
-
-    These options tune keyword matching or request execution without replacing the
-    adapter-managed query, vector query, result count, filtering, or returned fields.
-    ``rerank_hybrid_matches`` asks Typesense to calculate both keyword and vector
-    scores for every candidate before rank fusion; it can improve ranking at an
-    additional compute cost.
-    """
-
-    prefix: str | bool | list[bool]
-    infix: Literal["off", "always", "fallback"] | list[Literal["off", "always", "fallback"]]
-    pre_segmented_query: bool
-    stopwords: str | list[str]
-    validate_field_names: bool
-    query_by_weights: str | list[int]
-    text_match_type: Literal["max_score", "max_weight"]
-    prioritize_exact_match: bool
-    prioritize_token_position: bool
-    prioritize_num_matching_fields: bool
-    max_candidates: int
-    enable_synonyms: bool
-    filter_curated_hits: bool
-    synonym_prefix: bool
-    num_typos: int
-    min_len_1typo: int
-    min_len_2typo: int
-    split_join_tokens: Literal["off", "fallback", "always"]
-    typo_tokens_threshold: int
-    drop_tokens_threshold: int
-    drop_tokens_mode: Literal["right_to_left", "left_to_right", "both_sides:3"]
-    enable_typos_for_numerical_tokens: bool
-    enable_typos_for_alpha_numerical_tokens: bool
-    synonym_num_typos: int
-    rerank_hybrid_matches: bool
-
-
-_FILTER_FIELD_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
-_MANAGED_SEARCH_PARAMETERS = frozenset(
-    {
-        "q",
-        "vector_query",
-        "per_page",
-        "page",
-        "filter_by",
-        "include_fields",
-        "exclude_fields",
-        "query_by",
-    }
-)
-_SAFE_SEARCH_PARAMETERS = frozenset(TypesenseSearchParameters.__annotations__)
-_SAFE_HYBRID_SEARCH_PARAMETERS = frozenset(
-    {
-        *TypesenseSearchParameters.__annotations__,
-        *TypesenseHybridSearchParameters.__annotations__,
-    }
-)
-
-
-class TypesenseVectorStoreError(RuntimeError):
-    """Base class for runtime failures defined by this integration.
-
-    Direct instances report malformed or otherwise unusable Typesense responses;
-    subclasses describe collection and bulk-import failures. Typesense client and
-    embedding errors propagate unchanged so callers retain the originating type.
-    """
-
-
-class TypesenseCollectionError(TypesenseVectorStoreError):
-    """Raised when a collection has an incompatible schema.
-
-    A collection must contain the configured text and vector fields, with the
-    vector dimension and distance metric matching the store. The metadata field
-    is required and must be indexed when ``index_metadata=True``; when present,
-    it must be a nested object field.
-    """
-
-
-class TypesenseImportError(TypesenseVectorStoreError):
-    """Raised when Typesense reports one or more failed document imports.
-
-    Typesense's bulk import endpoint can partially succeed. Inspect ``failures`` to
-    identify records that were rejected. Successfully imported records are not rolled
-    back by Typesense.
-    """
-
-    def __init__(self, failures: Sequence[Mapping[str, Any]]) -> None:
-        """Build an error containing the per-document Typesense failures.
-
-        Args:
-            failures: Failed records returned by Typesense's bulk import API.
-                The mappings are copied so the exception remains inspectable even
-                if the caller reuses its response object.
-        """
-        self.failures = tuple(dict(failure) for failure in failures)
-        details_parts: list[str] = []
-        for failure in self.failures:
-            raw_document = failure.get("document")
-            document_id = (
-                raw_document.get("id", "<unknown>")
-                if isinstance(raw_document, Mapping)
-                else "<unknown>"
-            )
-            details_parts.append(
-                f"id={document_id!r}: {failure.get('error', 'unknown import error')}"
-            )
-        details = "; ".join(details_parts)
-        super().__init__(
-            f"Typesense rejected {len(self.failures)} document(s). "
-            f"Other documents in the batch may have succeeded. {details}"
-        )
 
 
 class TypesenseVectorStore(VectorStore):
@@ -337,75 +211,10 @@ class TypesenseVectorStore(VectorStore):
     # ------------------------------------------------------------------
     # Validation and serialization
     # ------------------------------------------------------------------
-    @staticmethod
-    def _validate_k(k: int) -> None:
-        """Validate a requested result count."""
-        if k < 0:
-            raise ValueError("`k` must be greater than or equal to 0.")
-
-    @staticmethod
-    def _validate_id(document_id: str) -> None:
-        """Validate an ID before it is placed in a Typesense URL or filter."""
-        if not document_id:
-            raise ValueError("Typesense document IDs must not be empty.")
-        if quote(document_id, safe="") != document_id:
-            raise ValueError(
-                "Typesense document IDs must contain only URL-safe, unreserved "
-                f"characters; got {document_id!r}."
-            )
-
-    @classmethod
-    def _resolve_ids(
-        cls,
-        documents: Sequence[Document],
-        ids: Sequence[str] | None,
-    ) -> list[str]:
-        """Return caller-supplied IDs or generate UUIDs for missing IDs."""
-        if ids is not None and len(ids) != len(documents):
-            raise ValueError(
-                "The number of IDs must match the number of documents. "
-                f"Got {len(ids)} IDs and {len(documents)} documents."
-            )
-
-        resolved_ids = (
-            list(ids)
-            if ids is not None
-            else [document.id or str(uuid.uuid4()) for document in documents]
-        )
-        for document_id in resolved_ids:
-            cls._validate_id(document_id)
-        return resolved_ids
-
-    @staticmethod
-    def _validate_vectors(
-        vectors: Sequence[Sequence[float]],
-        expected_count: int,
-    ) -> list[list[float]]:
-        """Validate vector count, dimensions, and finite numeric values."""
-        if len(vectors) != expected_count:
-            raise ValueError(
-                "Embedding model returned an unexpected number of vectors. "
-                f"Got {len(vectors)} vectors for {expected_count} documents."
-            )
-        if not vectors:
-            return []
-
-        dimension = len(vectors[0])
-        if dimension == 0:
-            raise ValueError("Embedding vectors must not be empty.")
-
-        validated: list[list[float]] = []
-        for index, vector in enumerate(vectors):
-            if len(vector) != dimension:
-                raise ValueError(
-                    "Embedding vectors must have equal dimensions. "
-                    f"Vector 0 has {dimension}; vector {index} has {len(vector)}."
-                )
-            converted = [float(value) for value in vector]
-            if not all(math.isfinite(value) for value in converted):
-                raise ValueError("Embedding vectors must contain only finite numbers.")
-            validated.append(converted)
-        return validated
+    _validate_k = staticmethod(validate_k)
+    _validate_id = staticmethod(validate_id)
+    _resolve_ids = staticmethod(resolve_ids)
+    _validate_vectors = staticmethod(validate_vectors)
 
     def _prepare_documents(
         self,
@@ -434,46 +243,8 @@ class TypesenseVectorStore(VectorStore):
         ]
         return list(resolved_ids), typesense_documents, len(validated_vectors[0])
 
-    @staticmethod
-    def _raise_for_import_failures(response: object) -> None:
-        """Raise an integration error for malformed or failed bulk imports."""
-        if not isinstance(response, list):
-            raise TypesenseVectorStoreError(
-                "Typesense returned an unexpected bulk import response."
-            )
-        if any(
-            not isinstance(item, Mapping) or not isinstance(item.get("success"), bool)
-            for item in response
-        ):
-            raise TypesenseVectorStoreError(
-                "Typesense returned a malformed record in its bulk import response."
-            )
-        failures = [
-            cast(Mapping[str, Any], item)
-            for item in response
-            if isinstance(item, Mapping) and item.get("success") is False
-        ]
-        if failures:
-            raise TypesenseImportError(failures)
-
-    @staticmethod
-    def _encode_filter_value(value: FilterScalar) -> str:
-        """Encode one scalar using Typesense filter literal syntax."""
-        if isinstance(value, bool):
-            return str(value).lower()
-        if isinstance(value, int):
-            return str(value)
-        if isinstance(value, float):
-            if not math.isfinite(value):
-                raise ValueError("Filter numbers must be finite.")
-            return repr(value)
-        if not isinstance(value, str):
-            raise TypeError(f"Unsupported Typesense filter value: {value!r}")
-
-        if re.fullmatch(r"[A-Za-z0-9_.~-]+", value):
-            return value
-        escaped = value.replace("\\", "\\\\").replace("`", "\\`")
-        return f"`{escaped}`"
+    _raise_for_import_failures = staticmethod(raise_for_import_failures)
+    _encode_filter_value = staticmethod(encode_filter_value)
 
     def _to_filter_by(self, filter_value: Filter) -> str:
         """Translate a filter mapping or raw expression to Typesense syntax.
@@ -482,24 +253,7 @@ class TypesenseVectorStore(VectorStore):
         ``&&``. A string is passed through unchanged, allowing callers to use the
         full Typesense filter language for advanced queries.
         """
-        if isinstance(filter_value, str):
-            return filter_value
-
-        clauses: list[str] = []
-        for key, value in filter_value.items():
-            if not _FILTER_FIELD_PATTERN.fullmatch(key):
-                raise ValueError(
-                    "Dictionary filter keys may contain only letters, numbers, `_`, "
-                    f"`-`, and `.`; got {key!r}. Use a raw Typesense filter string "
-                    "for other field names."
-                )
-            field_name = f"{self._metadata_key}.{key}"
-            if isinstance(value, Sequence) and not isinstance(value, str):
-                encoded = ",".join(self._encode_filter_value(item) for item in value)
-                clauses.append(f"{field_name}:=[{encoded}]")
-            else:
-                clauses.append(f"{field_name}:={self._encode_filter_value(value)}")
-        return " && ".join(clauses)
+        return to_filter_by(filter_value, self._metadata_key)
 
     def _validate_vector_query_options(
         self,
@@ -508,15 +262,7 @@ class TypesenseVectorStore(VectorStore):
         flat_search_cutoff: int | None,
     ) -> None:
         """Validate optional Typesense vector-search tuning parameters."""
-        if distance_threshold is not None:
-            if not math.isfinite(distance_threshold):
-                raise ValueError("`distance_threshold` must be finite.")
-            if self._vec_dist == "cosine" and distance_threshold < 0:
-                raise ValueError("`distance_threshold` must be non-negative for cosine distance.")
-        if ef is not None and ef <= 0:
-            raise ValueError("`ef` must be greater than 0.")
-        if flat_search_cutoff is not None and flat_search_cutoff < 0:
-            raise ValueError("`flat_search_cutoff` must be greater than or equal to 0.")
+        validate_vector_query_options(distance_threshold, ef, flat_search_cutoff, self._vec_dist)
 
     def _build_search_parameters(
         self,
@@ -549,7 +295,7 @@ class TypesenseVectorStore(VectorStore):
             parameters["exclude_fields"] = self._vector_key
 
         if search_parameters:
-            conflicts = _MANAGED_SEARCH_PARAMETERS.intersection(search_parameters)
+            conflicts = MANAGED_SEARCH_PARAMETERS.intersection(search_parameters)
             if conflicts:
                 names = ", ".join(sorted(conflicts))
                 raise ValueError(
@@ -557,7 +303,7 @@ class TypesenseVectorStore(VectorStore):
                     f"parameters: {names}."
                 )
 
-            unsupported = set(search_parameters).difference(_SAFE_SEARCH_PARAMETERS)
+            unsupported = set(search_parameters).difference(SAFE_SEARCH_PARAMETERS)
             if unsupported:
                 names = ", ".join(sorted(unsupported))
                 raise ValueError(
@@ -584,46 +330,24 @@ class TypesenseVectorStore(VectorStore):
         alpha: float | None = None,
     ) -> str:
         """Serialize an embedding and its Typesense vector-query options."""
-        self._validate_vector_query_options(distance_threshold, ef, flat_search_cutoff)
-        validated = self._validate_vectors([embedding], 1)[0]
-
-        vector_options = [f"k:{k}"]
-        if distance_threshold is not None:
-            vector_options.append(f"distance_threshold:{distance_threshold!r}")
-        if ef is not None:
-            vector_options.append(f"ef:{ef}")
-        if flat_search_cutoff is not None:
-            vector_options.append(f"flat_search_cutoff:{flat_search_cutoff}")
-        if alpha is not None:
-            vector_options.append(f"alpha:{alpha!r}")
-
-        vector = ",".join(repr(value) for value in validated)
-        return f"{self._vector_key}:([{vector}], {', '.join(vector_options)})"
+        return build_vector_query(
+            embedding,
+            k,
+            vector_key=self._vector_key,
+            vec_dist=self._vec_dist,
+            distance_threshold=distance_threshold,
+            ef=ef,
+            flat_search_cutoff=flat_search_cutoff,
+            alpha=alpha,
+        )
 
     def _normalize_hybrid_query_by(self, query_by: str | Sequence[str] | None) -> str:
         """Return a comma-separated keyword-field list for hybrid search."""
-        if query_by is None:
-            fields = [self._text_key]
-        elif isinstance(query_by, str):
-            fields = [field.strip() for field in query_by.split(",")]
-        else:
-            fields = [field.strip() for field in query_by]
-        if not fields or any(not field for field in fields):
-            raise ValueError("`query_by` must contain at least one non-empty field name.")
-        if self._vector_key in fields:
-            raise ValueError(
-                f"`query_by` must not contain vector field `{self._vector_key}` when "
-                "the adapter supplies a manual `vector_query`."
-            )
-        return ",".join(fields)
+        return normalize_hybrid_query_by(
+            query_by, text_key=self._text_key, vector_key=self._vector_key
+        )
 
-    @staticmethod
-    def _validate_hybrid_query(query: str, alpha: float) -> None:
-        """Validate the keyword query and vector weight used for rank fusion."""
-        if not query.strip():
-            raise ValueError("Hybrid search `query` must not be empty.")
-        if isinstance(alpha, bool) or not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
-            raise ValueError("`alpha` must be a finite number between 0 and 1.")
+    _validate_hybrid_query = staticmethod(validate_hybrid_query)
 
     def _validate_hybrid_search_options(
         self,
@@ -638,14 +362,14 @@ class TypesenseVectorStore(VectorStore):
         self._validate_hybrid_query(query, alpha)
         normalized_query_by = self._normalize_hybrid_query_by(query_by)
         if search_parameters:
-            conflicts = _MANAGED_SEARCH_PARAMETERS.intersection(search_parameters)
+            conflicts = MANAGED_SEARCH_PARAMETERS.intersection(search_parameters)
             if conflicts:
                 names = ", ".join(sorted(conflicts))
                 raise ValueError(
                     "`search_parameters` must not override hybrid-search-managed "
                     f"parameters: {names}."
                 )
-            unsupported = set(search_parameters).difference(_SAFE_HYBRID_SEARCH_PARAMETERS)
+            unsupported = set(search_parameters).difference(SAFE_HYBRID_SEARCH_PARAMETERS)
             if unsupported:
                 names = ", ".join(sorted(unsupported))
                 raise ValueError(f"Unsupported Typesense hybrid `search_parameters`: {names}.")
@@ -697,124 +421,25 @@ class TypesenseVectorStore(VectorStore):
         include_vectors: bool,
     ) -> list[tuple[Document, float, list[float] | None]]:
         """Convert Typesense hits to documents, distances, and optional vectors."""
-        if not isinstance(response, Mapping):
-            raise TypesenseVectorStoreError("Typesense search response must be an object.")
-        if "hits" not in response:
-            raise TypesenseVectorStoreError(
-                "Typesense search response is missing `hits`; grouped or malformed "
-                "responses are not supported."
-            )
-        hits = response["hits"]
-        if not isinstance(hits, list):
-            raise TypesenseVectorStoreError("Typesense search response has invalid `hits`.")
-
-        results: list[tuple[Document, float, list[float] | None]] = []
-        for raw_hit in hits:
-            if not isinstance(raw_hit, Mapping) or not isinstance(raw_hit.get("document"), Mapping):
-                raise TypesenseVectorStoreError("Typesense returned a malformed search hit.")
-
-            raw_document = dict(cast(Mapping[str, Any], raw_hit["document"]))
-            try:
-                document_id = raw_document.pop("id")
-                page_content = raw_document.pop(self._text_key)
-                distance = float(raw_hit["vector_distance"])
-            except (KeyError, TypeError, ValueError) as error:
-                raise TypesenseVectorStoreError(
-                    "Typesense search hit is missing a valid ID, text, or vector distance."
-                ) from error
-            if not isinstance(document_id, str) or not document_id:
-                raise TypesenseVectorStoreError(
-                    "Typesense search hit is missing a valid ID, text, or vector distance."
-                )
-            if not isinstance(page_content, str) or not math.isfinite(distance):
-                raise TypesenseVectorStoreError(
-                    "Typesense search hit is missing a valid ID, text, or vector distance."
-                )
-
-            raw_metadata = raw_document.pop(self._metadata_key, {})
-            if not isinstance(raw_metadata, Mapping):
-                raise TypesenseCollectionError(
-                    f"Field `{self._metadata_key}` must contain an object."
-                )
-
-            raw_vector = raw_document.pop(self._vector_key, None)
-            metadata = dict(raw_document)
-            metadata.update(raw_metadata)
-
-            vector: list[float] | None = None
-            if include_vectors:
-                if not isinstance(raw_vector, Sequence) or isinstance(raw_vector, str):
-                    raise TypesenseVectorStoreError(
-                        f"Typesense search hit is missing vector field `{self._vector_key}`."
-                    )
-                try:
-                    vector = [float(value) for value in raw_vector]
-                except (TypeError, ValueError) as error:
-                    raise TypesenseVectorStoreError(
-                        f"Typesense search hit has an invalid vector field `{self._vector_key}`."
-                    ) from error
-                if not vector or not all(math.isfinite(value) for value in vector):
-                    raise TypesenseVectorStoreError(
-                        f"Typesense search hit has an invalid vector field `{self._vector_key}`."
-                    )
-
-            results.append(
-                (
-                    Document(
-                        id=document_id,
-                        page_content=page_content,
-                        metadata=metadata,
-                    ),
-                    distance,
-                    vector,
-                )
-            )
-        return results
+        return parse_search_response(
+            response,
+            text_key=self._text_key,
+            vector_key=self._vector_key,
+            metadata_key=self._metadata_key,
+            include_vectors=include_vectors,
+        )
 
     def _parse_hybrid_search_response(
         self,
         response: Mapping[str, Any],
     ) -> list[tuple[Document, float]]:
         """Convert Typesense hybrid hits to documents and rank-fusion scores."""
-        if not isinstance(response, Mapping):
-            raise TypesenseVectorStoreError("Typesense hybrid search response must be an object.")
-        hits = response.get("hits")
-        if not isinstance(hits, list):
-            raise TypesenseVectorStoreError(
-                "Typesense hybrid search response is missing valid `hits`."
-            )
-
-        results: list[tuple[Document, float]] = []
-        for raw_hit in hits:
-            if not isinstance(raw_hit, Mapping) or not isinstance(raw_hit.get("document"), Mapping):
-                raise TypesenseVectorStoreError("Typesense returned a malformed hybrid search hit.")
-            raw_info = raw_hit.get("hybrid_search_info")
-            if not isinstance(raw_info, Mapping):
-                raise TypesenseVectorStoreError(
-                    "Typesense hybrid search hit is missing `hybrid_search_info`."
-                )
-            raw_score = raw_info.get("rank_fusion_score")
-            if raw_score is None or isinstance(raw_score, bool):
-                raise TypesenseVectorStoreError(
-                    "Typesense hybrid search hit has an invalid rank-fusion score."
-                )
-            try:
-                score = float(raw_score)
-            except (TypeError, ValueError) as error:
-                raise TypesenseVectorStoreError(
-                    "Typesense hybrid search hit has an invalid rank-fusion score."
-                ) from error
-            if not math.isfinite(score):
-                raise TypesenseVectorStoreError(
-                    "Typesense hybrid search hit has an invalid rank-fusion score."
-                )
-            results.append(
-                (
-                    self._document_from_typesense(cast(Mapping[str, Any], raw_hit["document"])),
-                    score,
-                )
-            )
-        return results
+        return parse_hybrid_search_response(
+            response,
+            text_key=self._text_key,
+            vector_key=self._vector_key,
+            metadata_key=self._metadata_key,
+        )
 
     # ------------------------------------------------------------------
     # Collection management
@@ -847,10 +472,10 @@ class TypesenseVectorStore(VectorStore):
         num_dim: int,
     ) -> None:
         """Verify that an existing collection can serve this store."""
+        raw_schema = cast(Mapping[str, Any], schema)
+        raw_fields = raw_schema.get("fields", [])
         fields = {
-            str(field.get("name")): field
-            for field in schema.get("fields", [])
-            if isinstance(field, Mapping)
+            str(field.get("name")): field for field in raw_fields if isinstance(field, Mapping)
         }
         text_field = fields.get(self._text_key)
         vector_field = fields.get(self._vector_key)
@@ -878,7 +503,7 @@ class TypesenseVectorStore(VectorStore):
             errors.append(f"`{self._metadata_key}` must have type `object`")
         elif self._index_metadata and metadata_field.get("index", True) is False:
             errors.append(f"`{self._metadata_key}` must be indexed")
-        if metadata_field is not None and schema.get("enable_nested_fields") is not True:
+        if metadata_field is not None and raw_schema.get("enable_nested_fields") is not True:
             errors.append("`enable_nested_fields` must be true")
 
         if errors:
@@ -1976,51 +1601,14 @@ class TypesenseVectorStore(VectorStore):
     # ------------------------------------------------------------------
     def _document_from_typesense(self, raw: Mapping[str, Any]) -> Document:
         """Deserialize one Typesense document into a LangChain document."""
-        values = dict(raw)
-        try:
-            document_id = values.pop("id")
-            page_content = values.pop(self._text_key)
-        except KeyError as error:
-            raise TypesenseCollectionError(
-                "Stored document is missing the configured ID or text field."
-            ) from error
-        if not isinstance(document_id, str) or not document_id:
-            raise TypesenseCollectionError("Stored document has an invalid ID field.")
-        if not isinstance(page_content, str):
-            raise TypesenseCollectionError(
-                f"Stored document field `{self._text_key}` must be a string."
-            )
-        values.pop(self._vector_key, None)
-        raw_metadata = values.pop(self._metadata_key, {})
-        if not isinstance(raw_metadata, Mapping):
-            raise TypesenseCollectionError(f"Field `{self._metadata_key}` must contain an object.")
-        metadata = dict(values)
-        metadata.update(raw_metadata)
-        return Document(id=document_id, page_content=page_content, metadata=metadata)
+        return document_from_typesense(
+            raw,
+            text_key=self._text_key,
+            vector_key=self._vector_key,
+            metadata_key=self._metadata_key,
+        )
 
-    @staticmethod
-    def _parse_export_response(response: object) -> list[Mapping[str, Any]]:
-        """Parse the JSONL returned by Typesense's document export endpoint."""
-        if not isinstance(response, str):
-            raise TypesenseVectorStoreError(
-                "Typesense returned an unexpected document export response."
-            )
-        documents: list[Mapping[str, Any]] = []
-        for line_number, line in enumerate(response.splitlines(), start=1):
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise TypesenseVectorStoreError(
-                    f"Typesense returned invalid JSON on export line {line_number}."
-                ) from error
-            if not isinstance(raw, Mapping):
-                raise TypesenseVectorStoreError(
-                    f"Typesense returned a non-object on export line {line_number}."
-                )
-            documents.append(raw)
-        return documents
+    _parse_export_response = staticmethod(parse_export_response)
 
     def _documents_in_requested_order(
         self,
@@ -2076,12 +1664,7 @@ class TypesenseVectorStore(VectorStore):
         )
         return self._documents_in_requested_order(self._parse_export_response(response), unique_ids)
 
-    @classmethod
-    def _ids_filter(cls, ids: Sequence[str]) -> str:
-        """Build a Typesense ID filter after validating every ID."""
-        for document_id in ids:
-            cls._validate_id(document_id)
-        return f"id:=[{','.join(ids)}]"
+    _ids_filter = staticmethod(ids_filter)
 
     def delete(
         self,
@@ -2159,31 +1742,7 @@ class TypesenseVectorStore(VectorStore):
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
-    @staticmethod
-    def _node_from_url(typesense_url: str) -> NodeConfigDict:
-        """Convert one HTTP(S) Typesense URL to the client's node format."""
-        if not typesense_url or not typesense_url.strip():
-            raise ValueError("`typesense_url` is required and must not be empty.")
-        parsed = urlparse(typesense_url)
-        if parsed.scheme not in ("http", "https") or parsed.hostname is None:
-            raise ValueError("`typesense_url` must be an absolute http:// or https:// URL.")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError(
-                "`typesense_url` must not contain credentials, a query, or a fragment."
-            )
-        if parsed.path not in ("", "/"):
-            raise ValueError("`typesense_url` must not contain a path.")
-        try:
-            port = parsed.port
-        except ValueError as error:
-            raise ValueError("`typesense_url` contains an invalid port.") from error
-        if port is not None and port <= 0:
-            raise ValueError("`typesense_url` contains an invalid port.")
-        return {
-            "host": parsed.hostname,
-            "port": port if port is not None else (443 if parsed.scheme == "https" else 80),
-            "protocol": parsed.scheme,
-        }
+    _node_from_url = staticmethod(node_from_url)
 
     @classmethod
     def from_client_params(

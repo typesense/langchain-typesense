@@ -2,12 +2,12 @@
 
 `langchain-typesense` is a LangChain `VectorStore` implementation for Typesense.
 
-It supports:
+**Features:**
 
-- synchronous and asynchronous operations;
-- vector similarity, hybrid keyword/vector search, MMR, and relevance scoring;
-- metadata filters; and
-- batch writes, ID lookups, and safe deletion.
+- **Sync & Async:** Supports both synchronous and asynchronous methods.
+- **Search & Retrieval**: Vector similarity search, hybrid keyword/vector search, MMR (Maximal Marginal Relevance), and relevance scoring.
+- **Filtering:** Metadata filtering via Typesense filter expressions.
+- **Document Management:** Batch writes, ID lookups, and deletions.
 
 ## Installation
 
@@ -89,17 +89,17 @@ store = TypesenseVectorStore(
 At least one client is required. Sync methods require a sync client. Async methods use the
 async client when supplied and otherwise run the sync method in a worker thread.
 
-| Parameter         | Default                    | What it does                                                                                     |
-| ----------------- | -------------------------- | ------------------------------------------------------------------------------------------------ |
-| `client`          | required unless async-only | Supplies the synchronous Typesense connection. Sync store methods require it.                    |
-| `async_client`    | `None`                     | Supplies a native async connection. Without it, async methods run sync methods in a worker.      |
-| `embedding`       | required                   | Embeds document text for writes and query text for searches.                                     |
-| `collection_name` | `"langchain-typesense"`    | Selects the Typesense collection used by this store.                                             |
-| `text_key`        | `"text"`                   | Names the field that stores `Document.page_content`.                                             |
-| `vector_key`      | `"vec"`                    | Names the `float[]` field that stores embeddings.                                                |
-| `metadata_key`    | `"metadata"`               | Names the object field that stores `Document.metadata`.                                          |
-| `index_metadata`  | `True`                     | Makes metadata filterable in collections created by the store. `False` keeps it return-only.     |
-| `vec_dist`        | `"cosine"`                 | Chooses cosine distance or inner-product distance (`"ip"`) for the vector field.                 |
+| Parameter         | Default                    | What it does                                                                                 |
+| ----------------- | -------------------------- | -------------------------------------------------------------------------------------------- |
+| `client`          | required unless async-only | Supplies the synchronous Typesense connection. Sync store methods require it.                |
+| `async_client`    | `None`                     | Supplies a native async connection. Without it, async methods run sync methods in a worker.  |
+| `embedding`       | required                   | Embeds document text for writes and query text for searches.                                 |
+| `collection_name` | `"langchain-typesense"`    | Selects the Typesense collection used by this store.                                         |
+| `text_key`        | `"text"`                   | Names the field that stores `Document.page_content`.                                         |
+| `vector_key`      | `"vec"`                    | Names the `float[]` field that stores embeddings.                                            |
+| `metadata_key`    | `"metadata"`               | Names the object field that stores `Document.metadata`.                                      |
+| `index_metadata`  | `True`                     | Makes metadata filterable in collections created by the store. `False` keeps it return-only. |
+| `vec_dist`        | `"cosine"`                 | Chooses cosine distance or inner-product distance (`"ip"`) for the vector field.             |
 
 Field names must be non-empty, distinct, and different from `id`.
 
@@ -127,12 +127,12 @@ store = TypesenseVectorStore.from_client_params(
 The URL must be absolute HTTP(S) and cannot contain credentials, a path, query, or
 fragment. Its connection-specific parameters are:
 
-| Parameter                    | Default                | What it does                                                                    |
-| ---------------------------- | ---------------------- | ------------------------------------------------------------------------------- |
-| `typesense_url`              | required               | Sets the single Typesense node, including its scheme, host, and optional port.  |
+| Parameter                    | Default                 | What it does                                                                     |
+| ---------------------------- | ----------------------- | -------------------------------------------------------------------------------- |
+| `typesense_url`              | required                | Sets the single Typesense node, including its scheme, host, and optional port.   |
 | `api_key`                    | `TYPESENSE_API_KEY` env | Authenticates requests. An explicit value takes precedence over the environment. |
-| `client_mode`                | `"sync"`               | Creates a `"sync"`, `"async"`, or `"both"` client pool.                         |
-| `connection_timeout_seconds` | `2.0`                  | Sets the request timeout; it must be finite and greater than zero.              |
+| `client_mode`                | `"sync"`                | Creates a `"sync"`, `"async"`, or `"both"` client pool.                          |
+| `connection_timeout_seconds` | `2.0`                   | Sets the request timeout; it must be finite and greater than zero.               |
 
 When the URL omits a port, the URL scheme supplies its standard port: HTTP uses `80`
 and HTTPS uses `443`. Port `8108` is Typesense's common direct-server port, not HTTP's
@@ -243,14 +243,14 @@ query_vector = embeddings.embed_query("release notes")
 documents = store.similarity_search_by_vector(query_vector, k=4)
 ```
 
-| Parameter            | Default | What it does                                                                                    |
-| -------------------- | ------- | ----------------------------------------------------------------------------------------------- |
-| `k`                  | `4`     | Caps the number of returned documents. `0` skips embedding and the Typesense request.           |
-| `filter`             | `None`  | Keeps only documents matching a metadata dictionary or raw Typesense filter expression.        |
-| `search_parameters`  | `None`  | Passes the safe Typesense tuning options listed below.                                          |
-| `distance_threshold` | `None`  | Drops hits above this raw vector distance. Smaller distances are closer.                        |
-| `ef`                 | `None`  | Expands the HNSW search. Larger values can improve recall at the cost of more server work.      |
-| `flat_search_cutoff` | `None`  | Switches to exact search when a filter leaves fewer than this many candidates.                  |
+| Parameter            | Default | What it does                                                                               |
+| -------------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `k`                  | `4`     | Caps the number of returned documents. `0` skips embedding and the Typesense request.      |
+| `filter`             | `None`  | Keeps only documents matching a metadata dictionary or raw Typesense filter expression.    |
+| `search_parameters`  | `None`  | Passes the safe Typesense options represented by `TypesenseSearchParameters`.              |
+| `distance_threshold` | `None`  | Drops hits above this raw vector distance. Smaller distances are closer.                   |
+| `ef`                 | `None`  | Expands the HNSW search. Larger values can improve recall at the cost of more server work. |
+| `flat_search_cutoff` | `None`  | Switches to exact search when a filter leaves fewer than this many candidates.             |
 
 Async equivalents are `asimilarity_search`, `asimilarity_search_with_score`, and
 `asimilarity_search_by_vector`.
@@ -280,23 +280,14 @@ filters require indexed metadata.
 
 ### Additional Typesense search parameters
 
-`search_parameters` accepts these keys:
+The exported [`TypesenseSearchParameters`](./langchain_typesense/_types.py) type shows which Typesense options this adapter
+accepts. See the [official Typesense Search API reference](https://typesense.org/docs/30.2/api/search.html)
+for their meanings, accepted values, and server defaults.
 
-| Area         | Keys                                                                                                                                                              |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Filtering    | `max_filter_by_candidates`, `enable_lazy_filter`                                                                                                                  |
-| Facets       | `facet_by`, `max_facet_values`, `facet_query`, `facet_query_num_typos`, `facet_return_parent`, `facet_sample_percent`, `facet_sample_threshold`, `facet_strategy` |
-| Highlighting | `highlight_fields`, `highlight_full_fields`, `highlight_affix_num_tokens`, `highlight_start_tag`, `highlight_end_tag`, `enable_highlight_v1`, `snippet_threshold` |
-| Execution    | `limit_hits`, `search_cutoff_ms`, `exhaustive_search`                                                                                                             |
-| Cache        | `use_cache`, `cache_ttl`                                                                                                                                          |
-| Curation     | `curation_tags`, `diversity_lambda`                                                                                                                               |
-
-The store manages `q`, `vector_query`, `per_page`, `page`, `filter_by`, `include_fields`,
-and `exclude_fields`; they cannot be overridden. Options that change pagination, sorting,
-grouping, or the hit shape are rejected. Curation options may reorder results.
-
-See the [Typesense search documentation](https://typesense.org/docs/30.2/api/search.html)
-for option semantics.
+The store manages `q`, `query_by`, `vector_query`, `per_page`, `page`, `filter_by`,
+`include_fields`, and `exclude_fields`; they cannot be overridden. Options that change
+pagination, sorting, grouping, or the hit shape are rejected. Curation options may reorder
+results.
 
 ## Hybrid search
 
@@ -331,56 +322,27 @@ documents = await store.ahybrid_search("wireless keyboard", k=4)
 documents_and_scores = await store.ahybrid_search_with_score("wireless keyboard", k=4)
 ```
 
-| Parameter            | Default           | What it does                                                                                 |
-| -------------------- | ----------------- | -------------------------------------------------------------------------------------------- |
-| `k`                  | `4`               | Caps the number of returned documents. `0` skips embedding and the Typesense request.        |
-| `alpha`              | `0.3`             | Sets the vector rank weight from `0` (keyword) to `1` (vector).                              |
+| Parameter            | Default               | What it does                                                                              |
+| -------------------- | --------------------- | ----------------------------------------------------------------------------------------- |
+| `k`                  | `4`                   | Caps the number of returned documents. `0` skips embedding and the Typesense request.     |
+| `alpha`              | `0.3`                 | Sets the vector rank weight from `0` (keyword) to `1` (vector).                           |
 | `query_by`           | configured text field | Selects one or more indexed string fields for keyword matching.                           |
-| `filter`             | `None`            | Keeps only documents matching a metadata dictionary or raw Typesense filter expression.     |
-| `search_parameters`  | `None`            | Passes safe keyword, filtering, execution, and fusion options to Typesense.                  |
-| `distance_threshold` | `None`            | Drops vector candidates above this raw distance.                                             |
-| `ef`                 | `None`            | Expands the HNSW vector search; larger values trade more server work for possible recall.    |
-| `flat_search_cutoff` | `None`            | Uses exact vector search when a filter leaves fewer than this many candidates.               |
+| `filter`             | `None`                | Keeps only documents matching a metadata dictionary or raw Typesense filter expression.   |
+| `search_parameters`  | `None`                | Passes safe keyword, filtering, execution, and fusion options to Typesense.               |
+| `distance_threshold` | `None`                | Drops vector candidates above this raw distance.                                          |
+| `ef`                 | `None`                | Expands the HNSW vector search; larger values trade more server work for possible recall. |
+| `flat_search_cutoff` | `None`                | Uses exact vector search when a filter leaves fewer than this many candidates.            |
 
 `query_by` defaults to `text_key`; the adapter adds `vector_key` separately through
 `vector_query`, so `query_by` must not include the vector field. `query_by_weights` must
 line up with the fields in `query_by`.
 
 Hybrid `search_parameters` accepts every safe option from
-`TypesenseSearchParameters`, plus the keyword and fusion options below. The exported
-`TypesenseHybridSearchParameters` type provides editor and type-checker support.
-
-| Option | What it controls |
-| ------ | ---------------- |
-| `prefix` | Enables prefix matching globally or per `query_by` field. |
-| `infix` | Chooses `"off"`, `"always"`, or `"fallback"` infix matching per field. |
-| `pre_segmented_query` | Treats spaces in the query as intentional token boundaries. |
-| `stopwords` | Removes the supplied stopwords from the keyword query. |
-| `validate_field_names` | Asks Typesense to reject missing field names instead of ignoring them. |
-| `query_by_weights` | Gives the keyword fields different relative weights. |
-| `text_match_type` | Chooses whether keyword ranking favors maximum score or field weight. |
-| `prioritize_exact_match` | Moves exact keyword matches ahead of non-exact matches. |
-| `prioritize_token_position` | Rewards matches appearing earlier in a field. |
-| `prioritize_num_matching_fields` | Rewards documents matching more `query_by` fields. |
-| `max_candidates` | Limits the candidates considered for prefix and typo expansion. |
-| `enable_synonyms` | Enables or disables configured synonyms for this query. |
-| `filter_curated_hits` | Applies `filter` to curated hits as well as ordinary hits. |
-| `synonym_prefix` | Allows synonym resolution on query-word prefixes. |
-| `num_typos` | Sets how many typos Typesense permits in a token. |
-| `min_len_1typo` | Sets the shortest token eligible for one typo. |
-| `min_len_2typo` | Sets the shortest token eligible for two typos. |
-| `split_join_tokens` | Controls whether splitting or joining words can count as a typo correction. |
-| `typo_tokens_threshold` | Sets when Typesense retries the query with typo-tolerant matching. |
-| `drop_tokens_threshold` | Sets when Typesense retries after dropping query tokens. Use `0` to disable that retry. |
-| `drop_tokens_mode` | Chooses which side Typesense drops query tokens from. |
-| `enable_typos_for_numerical_tokens` | Enables typo correction for all-numeric tokens. |
-| `enable_typos_for_alpha_numerical_tokens` | Enables typo correction for alphanumeric tokens. |
-| `synonym_num_typos` | Allows synonym lookup after this many typo corrections. |
-| `rerank_hybrid_matches` | Calculates both ranks for every candidate before fusion; this can improve ranking but costs more compute. |
-
-For multiword hybrid queries, `drop_tokens_threshold=0` avoids extra keyword retries that
-often duplicate work already handled by vector matching. Enable
-`rerank_hybrid_matches` when ranking quality matters more than the added server cost.
+[`TypesenseSearchParameters`](./langchain_typesense/_types.py), plus the keyword and fusion options represented by the
+exported [`TypesenseHybridSearchParameters`](./langchain_typesense/_types.py) type.
+See the [official Typesense hybrid-search documentation](https://typesense.org/docs/30.2/api/vector-search.html#hybrid-search)
+for rank-fusion behavior, keyword options, server defaults, reranking tradeoffs, and
+Typesense's performance guidance for multiword queries.
 
 `hybrid_search_with_score` returns Typesense's `rank_fusion_score`, where larger is
 better. It is rank-dependent—not a raw vector distance or normalized relevance score—so
